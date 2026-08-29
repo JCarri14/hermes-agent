@@ -267,3 +267,57 @@ def test_external_block_stale_run_id_does_not_kill_current_owner(tmp_path, kanba
     finally:
         _cleanup(leaderB, childB, procB)
         conn.close()
+
+
+def test_dependency_block_returns_true_and_reaps(tmp_path, kanban_home):
+    """QA2 C3 regression: kind='dependency' block must return True on success
+    AND reach the post-commit reap (the fall-through refactor previously made it
+    return False because the truly-blocked branch ran a second UPDATE on a row
+    now 'todo')."""
+    conn = kb.connect()
+    task_id = kb.create_task(
+        conn, title="depblock", assignee="default", workspace_kind="scratch",
+    )
+    kb.claim_task(conn, task_id, ttl_seconds=300)
+    host_prefix = kb._claimer_id().split(":", 1)[0]
+    marker = str(tmp_path / "dep")
+    leader, childpid, proc = _spawn_leader_with_child(marker)
+    try:
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, claim_lock=? WHERE id=?",
+            (leader, f"{host_prefix}:t", task_id),
+        )
+        conn.execute(
+            "UPDATE task_runs SET worker_pid=?, claim_lock=? "
+            "WHERE task_id=? AND ended_at IS NULL",
+            (leader, f"{host_prefix}:t", task_id),
+        )
+        conn.commit()
+        ok = kb.block_task(
+            conn, task_id, reason="dependency", kind="dependency",
+        )
+        assert ok is True, f"dependency block must return True, got {ok}"
+        time.sleep(0.3)
+        # reap must have fired for the obsolete owner + descendant
+        assert not kb._pid_alive(leader), "dependency block did not reap owner"
+        assert not kb._pid_alive(childpid), "dependency block did not reap child"
+        # task routed to todo (dependency-wait, not blocked)
+        task = kb.get_task(conn, task_id)
+        assert task.status == "todo"
+    finally:
+        _cleanup(leader, childpid, proc)
+        conn.close()
+
+
+def test_block_return_value_true_blocked_kind(tmp_path, kanban_home):
+    """QA2 note: block_task returns True on success for genuinely-blocked kind
+    (a None/needs_input block on a running task)."""
+    conn = kb.connect()
+    task_id = kb.create_task(
+        conn, title="blockret", assignee="default", workspace_kind="scratch",
+    )
+    kb.claim_task(conn, task_id, ttl_seconds=300)
+    assert kb.block_task(conn, task_id, reason="review") is True
+    task = kb.get_task(conn, task_id)
+    assert task.status == "blocked"
+    conn.close()
