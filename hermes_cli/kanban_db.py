@@ -6310,15 +6310,26 @@ def block_task(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
     recurrences = 0
-    # B: snapshot the worker process identity BEFORE any state mutation nukes
-    #   it. `block_task` historically NULLs `worker_pid`/`claim_lock` on every
-    #   terminal branch, and `_end_run` also NULLs the run's `worker_pid` — so
-    #   by the time the transition commits there is no handle left to reap the
-    #   obsolete process group or to forensically verify what owned the card.
-    #   We capture it here (and thread it into the event payload + reap).
+    # B/D4 C4: snapshot the worker process identity BEFORE any state mutation
+    #   nukes it. `block_task` historically NULLs `worker_pid`/`claim_lock` on
+    #   every terminal branch, and `_end_run` also NULLs the run's `worker_pid`
+    #   — so by the time the transition commits there is no handle left to reap
+    #   the obsolete process group or to forensically verify what owned the card.
+    #
+    #   CRITICAL (D4 QA): we must NOT reap here, inside the transaction and
+    #   BEFORE the transition's rowcount check. A stale/duplicate caller (e.g.
+    #   the original worker of the incident re-calling block) could otherwise
+    #   read the CURRENT worker_pid (= a NEW legitimate worker B), decide it is
+    #   "external", and kill B on a call whose guarded UPDATE later fails —
+    #   reproducing the double-owner in reverse. So we only SNAPSHOT here; the
+    #   reap happens AFTER the transition commits, on the SNAPSHOTTED pid, and
+    #   only when the rowcount check confirmed the transition applied. The reap
+    #   also runs OUTSIDE `write_txn` so the SIGTERM grace never holds the
+    #   board's exclusive write lock.
     _snap_pid: Optional[int] = None
     _snap_lock: Optional[str] = None
-    _self_reap_pid: Optional[int] = None
+    _ext_reap_pid: Optional[int] = None   # non-self obsolete owner to reap post-commit
+    _self_reap_pid: Optional[int] = None  # self-invoked caller to reap post-commit
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences, "
@@ -6343,15 +6354,14 @@ def block_task(
             _snap_pid = int(cur_row["worker_pid"])
         if "claim_lock" in cur_row.keys() and cur_row["claim_lock"]:
             _snap_lock = str(cur_row["claim_lock"])
-        # A: external (dispatcher/operator/other) ownership-ending transition.
-        #   Reap the obsolete process group BEFORE the durable write clears
-        #   the handle. Self-invoked blocks must NOT kill the caller before the
-        #   write commits — that worker is handled at the tail, post-write.
+        # Decide external vs self. Self-invoked blocks (worker blocking its own
+        # run) must NOT kill the caller before the write commits — both reap
+        # happen in the tail, after the durable transition, outside the txn.
         _self_invoked = _snap_pid is not None and _snap_pid == os.getpid()
-        if _snap_pid is not None and _snap_lock and not _self_invoked:
-            _terminate_reclaimed_worker(_snap_pid, _snap_lock)
-        else:
-            _self_reap_pid = _snap_pid if _snap_pid is not None and _self_invoked else None
+        if _self_invoked:
+            _self_reap_pid = _snap_pid
+        elif _snap_pid is not None and _snap_lock:
+            _ext_reap_pid = _snap_pid
 
         # Dependency blocks never enter the human ``blocked`` bucket — they
         # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
@@ -6392,16 +6402,7 @@ def block_task(
                 },
                 run_id=run_id,
             )
-            _blocked_task = get_task(conn, task_id)
-            _fire_kanban_lifecycle_hook(
-                "kanban_task_blocked",
-                task_id,
-                board=get_current_board(),
-                assignee=_blocked_task.assignee if _blocked_task else None,
-                run_id=run_id,
-                reason=reason,
-            )
-            return True
+            # fall through to the shared tail (post-commit reap + hook)
 
         # Truly-blocked kinds. Increment the unblock-loop counter when this is a
         # re-block for the SAME reason after a prior unblock. block_task only
@@ -6518,9 +6519,15 @@ def block_task(
         run_id=run_id,
         reason=reason,
     )
-    # A/B: self-invoked block — the durable write (+ hook) has committed, so it
-    #   is now safe to reap the caller's own process group as the LAST action
-    #   (D4 C2). This must never run before the board write succeeds.
+    # A/B: ownership-ending reap, AFTER the durable write committed and OUTSIDE
+    #   the write_txn (never hold the board's exclusive lock during the SIGTERM
+    #   grace). Only runs when a branch succeeded (the `rowcount != 1` guards
+    #   all `return False` before reaching here), so a stale/duplicate caller
+    #   whose guarded UPDATE fails NEVER reaps the current owner — the reap is
+    #   gated on the transition actually applying (D4 QA correction 1) and runs
+    #   against the SNAPSHOTTED pid, not a fresh read of the current worker_pid.
+    if _ext_reap_pid is not None:
+        _terminate_reclaimed_worker(_ext_reap_pid, _snap_lock)
     if _self_reap_pid is not None:
         _terminate_reclaimed_worker(_self_reap_pid, _snap_lock)
     return True

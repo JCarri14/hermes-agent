@@ -181,7 +181,7 @@ def test_end_run_preserves_worker_identity_in_metadata(tmp_path, kanban_home):
 
 def test_external_block_reaps_obsolete_owner(tmp_path, kanban_home):
     """A+B/D4 C2: externally-invoked block reaps the obsolete worker's process
-    group (terminate-before-write). No other live executor may survive.
+    group — no other live executor may survive.
 
     This is the RED-side regression fixture for the production incident
     (LIVE_INCIDENT_DOUBLE_OWNER_BLOCK_NO_REAP)."""
@@ -191,11 +191,9 @@ def test_external_block_reaps_obsolete_owner(tmp_path, kanban_home):
     )
     kb.claim_task(conn, task_id, ttl_seconds=300)
     host_prefix = kb._claimer_id().split(":", 1)[0]
-    # an obsolete 'worker' that is a live session leader with a child writer
     marker = str(tmp_path / "ext")
     leader, childpid, proc = _spawn_leader_with_child(marker)
     try:
-        # bind that leader as the recorded worker for this task
         conn.execute(
             "UPDATE tasks SET worker_pid=?, claim_lock=? WHERE id=?",
             (leader, f"{host_prefix}:t", task_id),
@@ -206,17 +204,66 @@ def test_external_block_reaps_obsolete_owner(tmp_path, kanban_home):
             (leader, f"{host_prefix}:t", task_id),
         )
         conn.commit()
-        # externally block (not self: leader != this test process pid)
         assert leader != os.getpid()
         ok = kb.block_task(conn, task_id, reason="ext block")
         assert ok
-        # group leader + descendant must be reaped by the transition
         time.sleep(0.3)
         assert not kb._pid_alive(leader), "obsolete owner survived external block"
         assert not kb._pid_alive(childpid), "descendant writer survived external block"
-        # board is blocked
         task = kb.get_task(conn, task_id)
         assert task.status == "blocked"
     finally:
         _cleanup(leader, childpid, proc)
+        conn.close()
+
+
+def test_external_block_stale_run_id_does_not_kill_current_owner(tmp_path, kanban_home):
+    """D4 QA correction 1: a stale/duplicate caller whose `expected_run_id` does
+    NOT match the live run must NEVER reap the current legitimate owner.
+
+    Regression for the reverse double-owner: old worker A crashed; new worker B
+    owns run2; a stale caller (remembering run1) calls block → the guarded
+    UPDATE fails on the run_id mismatch → block_task returns False and must NOT
+    have killed B's process group (the SNAPSHOTTED pid is B, but the reap is
+    gated on the transition applying, so it must not fire)."""
+    conn = kb.connect()
+    task_id = kb.create_task(
+        conn, title="staleblock", assignee="default", workspace_kind="scratch",
+    )
+    kb.claim_task(conn, task_id, ttl_seconds=300)
+    run_id = kb._current_run_id(conn, task_id)
+    assert run_id is not None
+    host_prefix = kb._claimer_id().split(":", 1)[0]
+    # B = a NEW legitimate worker, a live session leader with a child writer.
+    marker = str(tmp_path / "B")
+    leaderB, childB, procB = _spawn_leader_with_child(marker)
+    try:
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, claim_lock=? WHERE id=?",
+            (leaderB, f"{host_prefix}:t", task_id),
+        )
+        conn.execute(
+            "UPDATE task_runs SET worker_pid=?, claim_lock=? "
+            "WHERE id=?",
+            (leaderB, f"{host_prefix}:t", run_id),
+        )
+        conn.commit()
+        assert leaderB != os.getpid()
+        # A stale caller calls block with expected_run_id = run1 (a non-existent
+        # / stale run id that does NOT match the live run). The guarded UPDATE
+        # (ADD current_run_id = expected) must fail → return False.
+        stale_run = run_id + 999
+        ok = kb.block_task(
+            conn, task_id, reason="stale", expected_run_id=stale_run,
+        )
+        assert ok is False, "stale block must not apply"
+        time.sleep(0.3)
+        # B and its child must STILL be alive — the reap must not have fired.
+        assert kb._pid_alive(leaderB), "stale block killed current owner B"
+        assert kb._pid_alive(childB), "stale block killed B's descendant"
+        # board still running / owned by B
+        task = kb.get_task(conn, task_id)
+        assert task.status in ("running", "ready")
+    finally:
+        _cleanup(leaderB, childB, procB)
         conn.close()
