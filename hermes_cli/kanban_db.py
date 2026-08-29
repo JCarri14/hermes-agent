@@ -4358,6 +4358,22 @@ def _end_run(
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
+    # B: preserve the run's process identity in metadata BEFORE the UPDATE
+    #   nulls `worker_pid`/`claim_lock`. This keeps a forensic handle on disk
+    #   (and feeds any later reap/review) instead of erasing it in the same
+    #   transition — D4 C4.
+    _prev = conn.execute(
+        "SELECT worker_pid, claim_lock FROM task_runs WHERE id = ?",
+        (run_id,),
+    ).fetchone()
+    if _prev is not None:
+        _merged = dict(metadata) if metadata else {}
+        if (_prev["worker_pid"] or _prev["claim_lock"]) and (
+            "prev_worker_pid" not in _merged
+        ):
+            _merged["prev_worker_pid"] = int(_prev["worker_pid"]) if _prev["worker_pid"] else None
+            _merged["prev_claim_lock"] = _prev["claim_lock"]
+            metadata = _merged
     conn.execute(
         """
         UPDATE task_runs
@@ -6294,9 +6310,19 @@ def block_task(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
     recurrences = 0
+    # B: snapshot the worker process identity BEFORE any state mutation nukes
+    #   it. `block_task` historically NULLs `worker_pid`/`claim_lock` on every
+    #   terminal branch, and `_end_run` also NULLs the run's `worker_pid` — so
+    #   by the time the transition commits there is no handle left to reap the
+    #   obsolete process group or to forensically verify what owned the card.
+    #   We capture it here (and thread it into the event payload + reap).
+    _snap_pid: Optional[int] = None
+    _snap_lock: Optional[str] = None
+    _self_reap_pid: Optional[int] = None
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            "SELECT status, block_kind, block_recurrences, "
+            "worker_pid, claim_lock FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if cur_row is None:
@@ -6313,6 +6339,19 @@ def block_task(
             and cur_row["block_recurrences"] is not None
             else 0
         )
+        if "worker_pid" in cur_row.keys() and cur_row["worker_pid"]:
+            _snap_pid = int(cur_row["worker_pid"])
+        if "claim_lock" in cur_row.keys() and cur_row["claim_lock"]:
+            _snap_lock = str(cur_row["claim_lock"])
+        # A: external (dispatcher/operator/other) ownership-ending transition.
+        #   Reap the obsolete process group BEFORE the durable write clears
+        #   the handle. Self-invoked blocks must NOT kill the caller before the
+        #   write commits — that worker is handled at the tail, post-write.
+        _self_invoked = _snap_pid is not None and _snap_pid == os.getpid()
+        if _snap_pid is not None and _snap_lock and not _self_invoked:
+            _terminate_reclaimed_worker(_snap_pid, _snap_lock)
+        else:
+            _self_reap_pid = _snap_pid if _snap_pid is not None and _self_invoked else None
 
         # Dependency blocks never enter the human ``blocked`` bucket — they
         # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
@@ -6479,6 +6518,11 @@ def block_task(
         run_id=run_id,
         reason=reason,
     )
+    # A/B: self-invoked block — the durable write (+ hook) has committed, so it
+    #   is now safe to reap the caller's own process group as the LAST action
+    #   (D4 C2). This must never run before the board write succeeds.
+    if _self_reap_pid is not None:
+        _terminate_reclaimed_worker(_self_reap_pid, _snap_lock)
     return True
 
 
@@ -8261,6 +8305,57 @@ def _pid_alive(pid: Optional[int]) -> bool:
     return True
 
 
+def _worker_pgid(pid: int) -> Optional[int]:
+    """Return the worker's process-group id, verifying it is the leader.
+
+    Workers are spawned with ``start_new_session=True`` so the worker PID is
+    the leader of its own session/process group (PGID == PID). Before any
+    ``killpg`` we verify the recorded PID is actually a group leader -- if it
+    is not, the PID has been reused by an unrelated process and signalling the
+    group would risk collateral damage. Returns ``None`` when identity cannot
+    be established (or on Windows, where process-group signalling is not
+    portable).
+    """
+    if not hasattr(os, "getpgid") or not hasattr(os, "killpg"):
+        return None
+    try:
+        pgid = os.getpgid(int(pid))
+    except (ProcessLookupError, PermissionError, OSError):
+        return None
+    if pgid != int(pid):
+        # Not a group leader → not our start_new_session worker → PID reuse.
+        return None
+    return pgid
+
+
+def _signal_worker_process_group(
+    pid: int,
+    signal: Any,
+    kill: Any,
+    *,
+    source: str,
+    force_sig: Optional[int] = None,
+) -> bool:
+    """Signal the worker's whole process group when group identity is proven.
+
+    Returns True when a signal was delivered to the group (group path taken)
+    via SIGTERM (or ``force_sig``), False when the group path is unavailable
+    or identity is ambiguous (caller decides the per-PID fallback). Exists so
+    reclaim/block/reap all share one identity-safe killpg path (A).
+    """
+    pgid = _worker_pgid(pid)
+    if pgid is None:
+        return False
+    sig = force_sig if force_sig is not None else getattr(signal, "SIGTERM", None)
+    if sig is None:
+        return False
+    try:
+        os.killpg(pgid, sig)  # process-group termination (identity verified)
+        return True
+    except (ProcessLookupError, OSError):
+        return False
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
@@ -8292,17 +8387,29 @@ def _terminate_reclaimed_worker(
         return info
 
     info["termination_attempted"] = True
-    try:
-        kill(int(pid), signal.SIGTERM)
-    except ProcessLookupError:
-        # Process is already gone — that's a successful termination, not a
-        # survival. Leaving terminated=False here would make the reclaim guard
-        # misread a dead worker as still-alive and defer forever.
-        info["terminated"] = True
-        return info
-    except OSError:
-        return info
-
+    # A: reap the whole process group/session, not just the leader PID.
+    #   Workers are spawned with ``start_new_session=True`` (see
+    #   ``_default_spawn``) so the worker PID is its own process-group leader
+    #   (PGID == PID). Signalling only the leader can leave descendant
+    #   tool subprocesses (shell/git/MCP/browser) alive and still writing to
+    #   the worktree — a second, independent path to the double-writer failure
+    #   the platform already reproduces. Prefer ``killpg`` when identity is
+    #   proven; otherwise fall back to signalling the leader PID via the caller-
+    #   provided ``kill`` (or ``os.kill``) so hooks/tests keep observing the
+    #   SIGTERM on the leader.
+    group_signalled = _signal_worker_process_group(
+        int(pid), signal, kill, source="terminate_reclaimed"
+    )
+    if not group_signalled:
+        # Identity not proven (non-leader / PID reuse / Windows / test hook) or
+        # group signal unavailable — signal the leader PID directly.
+        _sigterm = getattr(signal, "SIGTERM", None) or getattr(signal, "TERM", None)
+        if _sigterm is not None:
+            try:
+                kill(int(pid), _sigterm)
+            except (ProcessLookupError, OSError):
+                return info
+    # Bounded grace: wait for the group/leader to exit.
     for _ in range(10):
         if not _pid_alive(pid):
             info["terminated"] = True
@@ -8313,9 +8420,19 @@ def _terminate_reclaimed_worker(
         try:
             # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM
             # (which maps to TerminateProcess via the stdlib shim).
-            _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-            kill(int(pid), _sigkill)
-            info["sigkill"] = True
+            _sigkill = getattr(signal, "SIGKILL", None) or getattr(signal, "KILL", None)
+            if _sigkill is None:
+                _sigkill = getattr(signal, "SIGTERM", None)
+            # Re-verify group identity before the escalation kill so we never
+            # SIGKILL an unrelated process group on PID reuse.
+            info["sigkill"] = _signal_worker_process_group(
+                int(pid), signal, kill, source="terminate_reclaimed_sigkill",
+                force_sig=_sigkill,
+            )
+            if not info["sigkill"]:
+                # group path unavailable — fall back to killing the leader only
+                kill(int(pid), _sigkill)
+                info["sigkill"] = True
         except (ProcessLookupError, OSError):
             return info
 
