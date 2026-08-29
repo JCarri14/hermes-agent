@@ -1,0 +1,113 @@
+"""Unit tests for the destructive_gate classifier.
+
+Covers ``hermes_cli.destructive_gate._classify`` / ``evaluate`` / the GO-comment
+matcher. The gate is deterministic and read-only: classification must never
+depend on external state, LLM, or network. Ambiguity is treated as
+DESTRUCTIVE_LIVE (require human GO) — the fail-safe bias.
+"""
+
+from hermes_cli.destructive_gate import (
+    DESTRUCTIVE_LIVE,
+    SAFE,
+    GateInput,
+    evaluate,
+    _classify,
+    _is_human_go,
+)
+
+
+# ─────────────────────────── classifier (_classify) ───────────────────────────
+
+
+def test_safe_no_verbs():
+    v = _classify("Add a new endpoint", "Implements /v1/health in the fastapi app.")
+    assert v.cls == SAFE
+
+
+def test_safe_dev_card_remove_word_not_live():
+    # "remove unused import" is a dev action, no live-resource marker -> SAFE.
+    v = _classify("Remove unused imports", "Remove the unused requests import in runner.py")
+    assert v.cls == SAFE
+
+
+def test_destructive_verb_without_live_marker_is_safe():
+    v = _classify("Delete a temp file", "Delete /tmp/scratch.txt locally")
+    assert v.cls == SAFE
+
+
+def test_destructive_live_bucket():
+    v = _classify(
+        "Cleanup client bucket",
+        "Delete the R2 bucket erp-client-a-docs (purge all objects).",
+    )
+    assert v.cls == DESTRUCTIVE_LIVE
+
+
+def test_destructive_verb_with_tenant_marker():
+    v = _classify("Teardown tenant", "Tear down the live tenant CLIENT_A isolation.")
+    assert v.cls == DESTRUCTIVE_LIVE
+
+
+def test_destructive_live_explicit_directive():
+    v = _classify(
+        "Drop the staging DB",
+        "live_action: destructive\nDrop the database schema staging.",
+    )
+    assert v.cls == DESTRUCTIVE_LIVE
+
+
+# ─────────────────────────────── GO matcher ───────────────────────────────────
+
+
+def test_go_matcher_canonical_forms():
+    assert _is_human_go("@go destructive t_abc123")
+    assert _is_human_go("GO_DESTRUCTIVE t_abc123")
+    assert _is_human_go("go destructive t_abc123")
+    assert _is_human_go("\n@go destructive t_abc123\napproved")
+
+
+def test_go_matcher_rejects_non_go():
+    assert not _is_human_go("delete the bucket, no approval yet")
+    assert not _is_human_go("@go teardown")  # wrong verb
+    assert not _is_human_go("I already did the cleanup")
+
+
+# ───────────────────────────────── evaluate ───────────────────────────────────
+
+
+def test_evaluate_safe_returns_safe():
+    inp = GateInput("t1", "Add endpoint", "plain dev change", ["@go destructive t1"])
+    assert evaluate(inp).cls == SAFE
+
+
+def test_evaluate_destructive_no_go_blocks():
+    inp = GateInput(
+        "t1",
+        "Cleanup client bucket",
+        "Delete the R2 bucket erp-client-a-docs.",
+        [],  # no human GO
+    )
+    v = evaluate(inp)
+    assert v.cls == DESTRUCTIVE_LIVE
+    assert "NO human GO recorded" in "; ".join(v.reasons)
+
+
+def test_evaluate_destructive_with_go_allows():
+    inp = GateInput(
+        "t1",
+        "Cleanup client bucket",
+        "Delete the R2 bucket erp-client-a-docs.",
+        ["@go destructive t1"],  # human GO recorded
+    )
+    v = evaluate(inp)
+    assert v.cls == DESTRUCTIVE_LIVE  # still classified destructive-live
+    assert "human GO recorded" in "; ".join(v.reasons)
+
+
+def test_evaluate_destructive_self_go_excluded():
+    # The dispatcher excludes executor-authored GO comments; here we pass a
+    # non-GO body and an executor author is filtered upstream. At the pure
+    # layer, an empty human_go_comments list means no GO -> block.
+    inp = GateInput("t1", "Drop table", "Drop the live orders table.", [])
+    v = evaluate(inp)
+    assert v.cls == DESTRUCTIVE_LIVE
