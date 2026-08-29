@@ -2647,6 +2647,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         # fallback the gateway-embedded dispatcher applies, so behaviour
         # matches regardless of which path runs the tick.
         max_in_progress = kb.resolve_max_in_progress(max_in_progress)
+        # Optional pre-action destructive gate (kanban.destructive_gate). When
+        # on, a ready card whose title/body signals a destructive/irreversible
+        # action on a LIVE resource is NOT spawned until a human GO comment is
+        # recorded (pre-verification -> human GO -> destructive action).
+        destructive_gate = bool(_kanban_cfg.get("destructive_gate", False))
         # CLI --max overrides config kanban.max_spawn when both are present;
         # CLI is the more explicit signal so it wins.
         cli_max = getattr(args, "max", None)
@@ -2657,6 +2662,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         default_assignee = None
         max_in_progress_per_profile = None
         max_in_progress = None
+        destructive_gate = False
         max_spawn = getattr(args, "max", None)
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
@@ -2667,6 +2673,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            destructive_gate=destructive_gate,
         )
     if getattr(args, "json", False):
         print(json.dumps({
@@ -2687,6 +2694,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "skipped_destructive_gate": [
+                {"task_id": tid, "class": cls_}
+                for (tid, cls_) in res.skipped_destructive_gate
+            ],
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -2723,6 +2734,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
+        )
+    if res.skipped_destructive_gate:
+        print(
+            f"Destructive gate (no human GO, held ready): "
+            + ", ".join(f"{tid}[{cls_}]" for (tid, cls_) in res.skipped_destructive_gate)
         )
     return 0
 
