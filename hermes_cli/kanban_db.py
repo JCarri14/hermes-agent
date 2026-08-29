@@ -8135,6 +8135,13 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    skipped_destructive_gate: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, class)`` ready tasks deferred this tick by the optional
+    pre-action destructive gate (``kanban.destructive_gate``). A card that
+    signals a destructive/irreversible action on a LIVE resource and has no
+    recorded human GO stays ``ready`` (never claimed / spawned) until a human
+    records the canonical GO comment. This is the pre-action gate: the
+    destructive action cannot start without prior human consent."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -9946,6 +9953,31 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+def _destructive_gate_requires_go(conn, task_id, *, board=None):
+    """Return ``(cls, reason)`` to block a ready destructive-live card, or
+    ``None`` to allow it. Deterministic + read-only; called only when
+    ``kanban.destructive_gate`` is enabled. Heavy logic lives in
+    ``hermes_cli.destructive_gate``.
+
+    ``None`` means: allow (card is not destructive-live, or a human GO comment
+    is recorded). A tuple means DESTRUCTIVE_LIVE -> the caller leaves the card
+    ``ready`` (no claim/spawn) and re-evaluates next tick until a human records
+    the canonical GO comment. This is the pre-action gate: the destructive
+    action is blocked from starting before human consent.
+    """
+    try:
+        from hermes_cli.destructive_gate import destructive_gate_requires_go as _dg_eval
+    except Exception as exc:
+        return ("DESTRUCTIVE_LIVE", f"destructive_gate unavailable: {exc}")
+    try:
+        return _dg_eval(conn, task_id, board=board)
+    except Exception as exc:
+        # Fail-safe: the gate must never crash the dispatch tick. Any
+        # unexpected error blocks (require human GO), never lets a possibly
+        # destructive live action through.
+        return ("DESTRUCTIVE_LIVE", f"destructive_gate evaluate error: {exc}")
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -9960,6 +9992,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    destructive_gate: bool = False,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -9995,6 +10028,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            destructive_gate=destructive_gate,
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
@@ -10015,6 +10049,7 @@ def dispatch_once(
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
                 reconcile_orphans=reconcile_orphans,
+                destructive_gate=destructive_gate,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -10042,6 +10077,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    destructive_gate: bool = False,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -10356,6 +10392,20 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
+        if destructive_gate:
+            _dg = _destructive_gate_requires_go(conn, row["id"], board=board)
+            if _dg is not None:
+                cls_, reason = _dg
+                result.skipped_destructive_gate.append((row["id"], cls_))
+                # Emit a diagnostic event so operators can see why the card
+                # stayed ready without guessing. Never mutates claim state.
+                if not dry_run:
+                    with write_txn(conn):
+                        _append_event(
+                            conn, row["id"], "destructive_gate_held",
+                            {"class": cls_, "reason": reason},
+                        )
+                continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             spawned += 1

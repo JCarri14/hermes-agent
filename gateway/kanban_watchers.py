@@ -1314,6 +1314,13 @@ class GatewayKanbanWatchersMixin:
                 "kanban dispatcher: disabled via config kanban.dispatch_in_gateway=false"
             )
             return
+        # Optional pre-action destructive gate (kanban.destructive_gate).
+        # Default OFF. When on, a ready card signaling a destructive/
+        # irreversible action on a LIVE resource is not claimed/spawned until
+        # a human GO comment is recorded (@go destructive <task_id>).
+        destructive_gate = bool(kanban_cfg.get("destructive_gate", False))
+        if destructive_gate:
+            logger.info("kanban dispatcher: destructive_gate=on")
 
         try:
             from hermes_cli import kanban_db as _kb
@@ -1573,6 +1580,7 @@ class GatewayKanbanWatchersMixin:
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     reconcile_orphans=reconcile_orphans,
+                    destructive_gate=destructive_gate,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
