@@ -8361,7 +8361,9 @@ def _signal_worker_process_group(
     if sig is None:
         return False
     try:
-        os.killpg(pgid, sig)  # process-group termination (identity verified)
+        # Reachable only when _worker_pgid proved os.killpg exists (hasattr)
+        # and pid is a real process-group leader (platform-gated).
+        os.killpg(pgid, sig)  # windows-footgun: ok — process-group termination (identity verified)
         return True
     except (ProcessLookupError, OSError):
         return False
