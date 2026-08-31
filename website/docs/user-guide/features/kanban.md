@@ -229,7 +229,22 @@ kanban:
   review_dispatch: true            # default: spawn the assigned profile with
                                    # the bundled sdlc-review skill. Set false
                                    # for human-only review boards.
+  # Productive boards force strict destructive gating. A destructive verb
+  # without a recognized live marker still requires a prior human GO.
+  productive_boards: [erp]
+  destructive_allowlist:
+    - pattern: "delete /tmp/.*"
+      reason: "local scratch only"
 ```
+
+On a board listed in `productive_boards`, the dispatcher enables the
+pre-action destructive gate automatically. A task with a destructive signal
+stays `ready` until a different human records `@go destructive <task_id>`.
+Use `destructive_allowlist` only for explicitly benign operations; entries are
+case-insensitive regular expressions matched against the task title and body.
+Malformed entries are ignored, so they cannot widen access. Boards not listed
+remain backward compatible: `kanban.destructive_gate: true` is still the
+explicit global opt-in for the existing live-resource classifier.
 
 Override the config flag at runtime via `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0`
 for debugging. Standard gateway supervision applies: run `hermes gateway

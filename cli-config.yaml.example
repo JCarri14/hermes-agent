@@ -323,6 +323,12 @@ model:
 # Disable this only when every review is performed manually from the dashboard.
 kanban:
   review_dispatch: true
+  # Production boards force strict destructive gating even when
+  # destructive_gate is false globally. Matching allowlist entries are the
+  # only benign-operation exception and should be narrowly scoped regexes.
+  productive_boards: []
+  destructive_gate: false
+  destructive_allowlist: []
 
 # =============================================================================
 # Terminal Tool Configuration

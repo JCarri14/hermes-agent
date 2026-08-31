@@ -9953,7 +9953,7 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
-def _destructive_gate_requires_go(conn, task_id, *, board=None):
+def _destructive_gate_requires_go(conn, task_id, *, board=None, strict: bool = False, allowlist=None):
     """Return ``(cls, reason)`` to block a ready destructive-live card, or
     ``None`` to allow it. Deterministic + read-only; called only when
     ``kanban.destructive_gate`` is enabled. Heavy logic lives in
@@ -9970,7 +9970,7 @@ def _destructive_gate_requires_go(conn, task_id, *, board=None):
     except Exception as exc:
         return ("DESTRUCTIVE_LIVE", f"destructive_gate unavailable: {exc}")
     try:
-        return _dg_eval(conn, task_id, board=board)
+        return _dg_eval(conn, task_id, board=board, strict=strict, allowlist=allowlist)
     except Exception as exc:
         # Fail-safe: the gate must never crash the dispatch tick. Any
         # unexpected error blocks (require human GO), never lets a possibly
@@ -9993,6 +9993,8 @@ def dispatch_once(
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
     destructive_gate: bool = False,
+    destructive_strict: bool = False,
+    destructive_allowlist=None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -10029,6 +10031,8 @@ def dispatch_once(
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
             destructive_gate=destructive_gate,
+            destructive_strict=destructive_strict,
+            destructive_allowlist=destructive_allowlist,
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
@@ -10050,6 +10054,8 @@ def dispatch_once(
                 max_in_progress_per_profile=max_in_progress_per_profile,
                 reconcile_orphans=reconcile_orphans,
                 destructive_gate=destructive_gate,
+                destructive_strict=destructive_strict,
+                destructive_allowlist=destructive_allowlist,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -10078,6 +10084,8 @@ def _dispatch_once_locked(
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
     destructive_gate: bool = False,
+    destructive_strict: bool = False,
+    destructive_allowlist=None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -10117,6 +10125,15 @@ def _dispatch_once_locked(
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
+
+    if destructive_gate:
+        try:
+            from hermes_cli.destructive_gate import compile_allowlist
+            destructive_allowlist = compile_allowlist(destructive_allowlist)
+        except Exception:
+            # A malformed allowlist must never widen access; dispatch still
+            # proceeds with the gate and no benign-operation exception.
+            destructive_allowlist = []
 
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
@@ -10393,7 +10410,13 @@ def _dispatch_once_locked(
                     )
             continue
         if destructive_gate:
-            _dg = _destructive_gate_requires_go(conn, row["id"], board=board)
+            _dg = _destructive_gate_requires_go(
+                conn,
+                row["id"],
+                board=board,
+                strict=destructive_strict,
+                allowlist=destructive_allowlist,
+            )
             if _dg is not None:
                 cls_, reason = _dg
                 result.skipped_destructive_gate.append((row["id"], cls_))

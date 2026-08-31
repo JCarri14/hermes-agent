@@ -141,6 +141,34 @@ def test_dispatch_spawns_destructive_with_go(board_home):
     assert row["status"] == "running"
 
 
+def test_productive_dispatch_blocks_ambiguous_destructive_work_without_go(board_home):
+    """Strict productive context closes the old verb-without-live-marker gap."""
+    with kb.connect() as conn:
+        _insert(conn, "ambiguous", title="Delete a temp file",
+                body="Delete /tmp/scratch.txt locally", assignee="default", status="ready")
+    with kb.connect_closing() as conn:
+        res = kb.dispatch_once(
+            conn, spawn_fn=_fake_spawn, dry_run=False, destructive_gate=True,
+            destructive_strict=True,
+        )
+    assert res.skipped_destructive_gate == [("ambiguous", "DESTRUCTIVE_LIVE")]
+    assert res.spawned == []
+
+
+def test_productive_dispatch_allows_explicit_benign_allowlist_match(board_home):
+    with kb.connect() as conn:
+        _insert(conn, "benign", title="Delete a temp file",
+                body="Delete /tmp/scratch.txt locally", assignee="default", status="ready")
+    with kb.connect_closing() as conn:
+        res = kb.dispatch_once(
+            conn, spawn_fn=_fake_spawn, dry_run=False, destructive_gate=True,
+            destructive_strict=True,
+            destructive_allowlist=[{"pattern": r"delete /tmp/.*", "reason": "local scratch"}],
+        )
+    assert res.skipped_destructive_gate == []
+    assert [spawn[0] for spawn in res.spawned] == ["benign"]
+
+
 def test_gate_off_is_legacy_identical(board_home):
     """Gate OFF (default) -> destructive-live card spawns immediately,
     byte-for-byte as before (no gate interference)."""

@@ -2647,11 +2647,15 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         # fallback the gateway-embedded dispatcher applies, so behaviour
         # matches regardless of which path runs the tick.
         max_in_progress = kb.resolve_max_in_progress(max_in_progress)
-        # Optional pre-action destructive gate (kanban.destructive_gate). When
-        # on, a ready card whose title/body signals a destructive/irreversible
-        # action on a LIVE resource is NOT spawned until a human GO comment is
-        # recorded (pre-verification -> human GO -> destructive action).
-        destructive_gate = bool(_kanban_cfg.get("destructive_gate", False))
+        # Productive boards force the pre-action gate on and use strict
+        # classification. Other boards retain the existing opt-in behavior.
+        productive_boards = _kanban_cfg.get("productive_boards", [])
+        if not isinstance(productive_boards, list):
+            productive_boards = []
+        board_slug = getattr(args, "board", None) or kb.DEFAULT_BOARD
+        destructive_strict = board_slug in productive_boards
+        destructive_gate = bool(_kanban_cfg.get("destructive_gate", False)) or destructive_strict
+        destructive_allowlist = _kanban_cfg.get("destructive_allowlist", [])
         # CLI --max overrides config kanban.max_spawn when both are present;
         # CLI is the more explicit signal so it wins.
         cli_max = getattr(args, "max", None)
@@ -2663,6 +2667,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_in_progress_per_profile = None
         max_in_progress = None
         destructive_gate = False
+        destructive_strict = False
+        destructive_allowlist = []
         max_spawn = getattr(args, "max", None)
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
@@ -2674,6 +2680,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             destructive_gate=destructive_gate,
+            destructive_strict=destructive_strict,
+            destructive_allowlist=destructive_allowlist,
         )
     if getattr(args, "json", False):
         print(json.dumps({
