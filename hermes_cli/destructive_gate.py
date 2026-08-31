@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, List, Optional, Pattern
 
 # Sentinel classification strings.
 DESTRUCTIVE_LIVE = "DESTRUCTIVE_LIVE"
@@ -96,7 +96,9 @@ EXPLICIT_DIRECTIVES = (
 
 # Canonical human-GO comment marker. Readable, greppable, version-stable.
 # Accepts:  "@go destructive <task_id>"   /   "GO_DESTRUCTIVE <task_id>"
-GO_LINE_RE = re.compile(r"^\s*(?:@go\s+destructive|go_destructive|go\s+destructive)\b", re.IGNORECASE)
+# Group 1 captures the task_id; the caller must validate it against the
+# card being evaluated to enforce per-card preauthorization (fail-closed).
+GO_LINE_RE = re.compile(r"^\s*(?:@go\s+destructive|go_destructive|go\s+destructive)\s+(\S+)", re.IGNORECASE)
 
 
 @dataclass
@@ -108,6 +110,8 @@ class GateInput:
     title: str
     body: str
     human_go_comments: List[str] = field(default_factory=list)  # GO comment bodies, if any
+    strict: bool = False
+    allowlist: List[tuple[Pattern[str], str]] = field(default_factory=list)
 
 
 @dataclass
@@ -133,7 +137,41 @@ def _has_live_marker(title: str, body: str) -> bool:
     return any(m in low for m in LIVE_RESOURCE_MARKERS)
 
 
-def _classify(title: str, body: str) -> Verdict:
+def compile_allowlist(entries: Any) -> List[tuple[Pattern[str], str]]:
+    """Compile explicit benign-operation patterns from config.
+
+    Invalid entries are ignored rather than widened into a match: a malformed
+    allowlist must never silently permit productive work.
+    """
+    if not isinstance(entries, list):
+        return []
+    compiled: List[tuple[Pattern[str], str]] = []
+    for entry in entries:
+        if (
+            isinstance(entry, tuple)
+            and len(entry) == 2
+            and hasattr(entry[0], "search")
+            and isinstance(entry[1], str)
+        ):
+            compiled.append(entry)
+            continue
+        if isinstance(entry, str):
+            pattern, reason = entry, "explicit allowlist"
+        elif isinstance(entry, dict):
+            pattern = entry.get("pattern")
+            reason = entry.get("reason") or "explicit allowlist"
+        else:
+            continue
+        if not isinstance(pattern, str) or not pattern.strip() or not isinstance(reason, str):
+            continue
+        try:
+            compiled.append((re.compile(pattern, re.IGNORECASE), reason))
+        except re.error:
+            continue
+    return compiled
+
+
+def _classify(title: str, body: str, *, strict: bool = False) -> Verdict:
     """Classify a card as destructive-live or safe. Pure + deterministic."""
     reasons: List[str] = []
     text = title + "\n" + body
@@ -146,6 +184,9 @@ def _classify(title: str, body: str) -> Verdict:
         if _has_live_marker(title, body):
             reasons.append("destructive verb + live-resource marker")
             return Verdict(DESTRUCTIVE_LIVE, reasons)
+        if strict:
+            reasons.append("destructive verb on strict productive board")
+            return Verdict(DESTRUCTIVE_LIVE, reasons)
         reasons.append("destructive verb present but no live-resource marker")
 
     # No destructive verb, or a verb without a live target => not gated.
@@ -154,9 +195,17 @@ def _classify(title: str, body: str) -> Verdict:
     return Verdict(SAFE, reasons + ["not destructive-live"])
 
 
-def _is_human_go(body: str) -> bool:
-    """True when a comment body contains the canonical GO line."""
-    return bool(GO_LINE_RE.search(body))
+def _is_human_go(body: str, task_id: str) -> bool:
+    """True when a comment body contains the canonical GO line for ``task_id``.
+
+    Extracts the task_id from the GO line and validates it against the
+    expected card id. A GO intended for a different card (e.g.
+    ``@go destructive t_OTHER``) does NOT authorize this card.
+    """
+    m = GO_LINE_RE.search(body)
+    if not m:
+        return False
+    return m.group(1) == task_id
 
 
 def evaluate(inp: GateInput) -> Verdict:
@@ -169,10 +218,14 @@ def evaluate(inp: GateInput) -> Verdict:
     This is the pure classifier. Whether a GO is present is surfaced via the
     reasons list ("human GO recorded" when present).
     """
-    v = _classify(inp.title, inp.body)
+    text = inp.title + "\n" + inp.body
+    for pattern, reason in inp.allowlist:
+        if pattern.search(text):
+            return Verdict(SAFE, [f"allowlist: {reason}"])
+    v = _classify(inp.title, inp.body, strict=inp.strict)
     if v.cls == SAFE:
         return v
-    if any(_is_human_go(c) for c in inp.human_go_comments):
+    if any(_is_human_go(c, inp.task_id) for c in inp.human_go_comments):
         return Verdict(DESTRUCTIVE_LIVE, ["destructive-live but human GO recorded"])
     return Verdict(DESTRUCTIVE_LIVE, v.reasons + ["NO human GO recorded -> block"])
 
@@ -198,7 +251,7 @@ def _human_go_comment_bodies(conn, task_id, *, assignee: Optional[str] = None) -
     for r in rows:
         author = (r["author"] or "").strip()
         body = (r["body"] or "").strip()
-        if not _is_human_go(body):
+        if not _is_human_go(body, task_id):
             continue
         if assignee and author and author.lower() == str(assignee).lower():
             continue  # self-authored GO by the executor is not a human GO
@@ -206,7 +259,7 @@ def _human_go_comment_bodies(conn, task_id, *, assignee: Optional[str] = None) -
     return out
 
 
-def destructive_gate_requires_go(conn, task_id, *, board=None):
+def destructive_gate_requires_go(conn, task_id, *, board=None, strict: bool = False, allowlist=None):
     """Admission decision for a ready card. Mirrors the conflict-gate contract:
 
       None  -> allow (card is not destructive-live, OR a human GO is recorded).
@@ -235,7 +288,14 @@ def destructive_gate_requires_go(conn, task_id, *, board=None):
 
     go_comments = _human_go_comment_bodies(conn, task_id, assignee=assignee)
     try:
-        v = evaluate(GateInput(task_id=task_id, title=title, body=body, human_go_comments=go_comments))
+        v = evaluate(GateInput(
+            task_id=task_id,
+            title=title,
+            body=body,
+            human_go_comments=go_comments,
+            strict=strict,
+            allowlist=compile_allowlist(allowlist),
+        ))
     except Exception as exc:
         # Fail-safe: any unexpected error degrades to block (require GO), never
         # lets a possibly-destructive action through without a human GO.
