@@ -118,6 +118,17 @@ def test_go_matcher_correct_task_id_allowed():
     assert _is_human_go("go destructive t_abc123", "t_abc123")
 
 
+def test_go_matcher_multiline_comment_body():
+    """GO marker must be found anywhere in the comment body, including
+    after preceding text on a different line (contract: 'anywhere in
+    the comment body'). Reproduces QA rejection #4 (no MULTILINE)."""
+    assert _is_human_go("approval granted:\n@go destructive t_target", "t_target")
+    assert _is_human_go("some note\n@go destructive t_abc123\nmore text", "t_abc123")
+    assert _is_human_go("Reviewed the plan.\n\ngo destructive t_card", "t_card")
+    # Still rejects wrong task_id even in multiline
+    assert not _is_human_go("approval granted:\n@go destructive t_OTHER", "t_target")
+
+
 # ───────────────────────────────── evaluate ───────────────────────────────────
 
 

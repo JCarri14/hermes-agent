@@ -98,7 +98,7 @@ EXPLICIT_DIRECTIVES = (
 # Accepts:  "@go destructive <task_id>"   /   "GO_DESTRUCTIVE <task_id>"
 # Group 1 captures the task_id; the caller must validate it against the
 # card being evaluated to enforce per-card preauthorization (fail-closed).
-GO_LINE_RE = re.compile(r"^\s*(?:@go\s+destructive|go_destructive|go\s+destructive)\s+(\S+)", re.IGNORECASE)
+GO_LINE_RE = re.compile(r"^\s*(?:@go\s+destructive|go_destructive|go\s+destructive)\s+(\S+)", re.IGNORECASE | re.MULTILINE)
 
 
 @dataclass
