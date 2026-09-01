@@ -2292,13 +2292,33 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 continue
 
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                ok = kb.complete_task(
+                    conn, tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+            except kb.CompletionPersistenceError as persist_err:
+                failed.append(tid)
+                print(
+                    f"kanban: persistence gate blocked completion of {tid}: "
+                    f"{persist_err}. Task is still in-flight and its workspace "
+                    f"was preserved; fix the deliverable and retry.",
+                    file=sys.stderr,
+                )
+                continue
+            except kb.ArtifactPreservationError as artifact_err:
+                failed.append(tid)
+                print(
+                    f"kanban: could not preserve declared artifacts for {tid}: "
+                    f"{artifact_err}. Task is still in-flight and its workspace "
+                    f"was kept; fix the artifact path and retry.",
+                    file=sys.stderr,
+                )
+                continue
+            if not ok:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
@@ -2647,6 +2667,15 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         # fallback the gateway-embedded dispatcher applies, so behaviour
         # matches regardless of which path runs the tick.
         max_in_progress = kb.resolve_max_in_progress(max_in_progress)
+        # Productive boards force the pre-action gate on and use strict
+        # classification. Other boards retain the existing opt-in behavior.
+        productive_boards = _kanban_cfg.get("productive_boards", [])
+        if not isinstance(productive_boards, list):
+            productive_boards = []
+        board_slug = getattr(args, "board", None) or kb.DEFAULT_BOARD
+        destructive_strict = board_slug in productive_boards
+        destructive_gate = bool(_kanban_cfg.get("destructive_gate", False)) or destructive_strict
+        destructive_allowlist = _kanban_cfg.get("destructive_allowlist", [])
         # CLI --max overrides config kanban.max_spawn when both are present;
         # CLI is the more explicit signal so it wins.
         cli_max = getattr(args, "max", None)
@@ -2657,6 +2686,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         default_assignee = None
         max_in_progress_per_profile = None
         max_in_progress = None
+        destructive_gate = False
+        destructive_strict = False
+        destructive_allowlist = []
         max_spawn = getattr(args, "max", None)
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
@@ -2667,6 +2699,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            destructive_gate=destructive_gate,
+            destructive_strict=destructive_strict,
+            destructive_allowlist=destructive_allowlist,
         )
     if getattr(args, "json", False):
         print(json.dumps({
@@ -2687,6 +2722,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "skipped_destructive_gate": [
+                {"task_id": tid, "class": cls_}
+                for (tid, cls_) in res.skipped_destructive_gate
+            ],
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -2723,6 +2762,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
+        )
+    if res.skipped_destructive_gate:
+        print(
+            f"Destructive gate (no human GO, held ready): "
+            + ", ".join(f"{tid}[{cls_}]" for (tid, cls_) in res.skipped_destructive_gate)
         )
     return 0
 

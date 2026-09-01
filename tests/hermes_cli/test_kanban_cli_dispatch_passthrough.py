@@ -94,3 +94,32 @@ def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypat
     )
 
 
+def test_cli_enables_strict_gate_only_for_configured_productive_board(
+    isolated_kanban_home, monkeypatch
+):
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {
+            "productive_boards": ["default"],
+            "destructive_allowlist": [{"pattern": r"delete /tmp/.*", "reason": "local scratch"}],
+        }},
+    )
+    captured = {}
+    monkeypatch.setattr(
+        kanban_db, "dispatch_once",
+        lambda conn, **kwargs: (captured.update(kwargs), kanban_db.DispatchResult())[1],
+    )
+
+    args = argparse.Namespace(dry_run=True, max=None, failure_limit=2, json=False)
+    kb_cli._cmd_dispatch(args)
+
+    assert captured["destructive_gate"] is True
+    assert captured["destructive_strict"] is True
+    assert captured["destructive_allowlist"] == [
+        {"pattern": r"delete /tmp/.*", "reason": "local scratch"}
+    ]
+
+

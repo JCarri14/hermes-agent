@@ -898,12 +898,23 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             s = payload.status
             ok = True
             if s == "done":
-                ok = kanban_db.complete_task(
-                    conn, task_id,
-                    result=payload.result,
-                    summary=payload.summary,
-                    metadata=payload.metadata,
-                )
+                try:
+                    ok = kanban_db.complete_task(
+                        conn, task_id,
+                        result=payload.result,
+                        summary=payload.summary,
+                        metadata=payload.metadata,
+                    )
+                except kanban_db.CompletionPersistenceError as persist_err:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"completion blocked by persistence gate: {persist_err}",
+                    )
+                except kanban_db.ArtifactPreservationError as artifact_err:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"could not preserve declared artifacts: {artifact_err}",
+                    )
             elif s == "blocked":
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
             elif s == "scheduled":
@@ -1342,12 +1353,27 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                 if payload.status is not None and not payload.archive:
                     s = payload.status
                     if s == "done":
-                        ok = kanban_db.complete_task(
-                            conn, tid,
-                            result=payload.result,
-                            summary=payload.summary,
-                            metadata=payload.metadata,
-                        )
+                        try:
+                            ok = kanban_db.complete_task(
+                                conn, tid,
+                                result=payload.result,
+                                summary=payload.summary,
+                                metadata=payload.metadata,
+                            )
+                        except kanban_db.CompletionPersistenceError as persist_err:
+                            entry.update(
+                                ok=False,
+                                error=f"completion blocked by persistence gate: {persist_err}",
+                            )
+                            results.append(entry)
+                            continue
+                        except kanban_db.ArtifactPreservationError as artifact_err:
+                            entry.update(
+                                ok=False,
+                                error=f"could not preserve declared artifacts: {artifact_err}",
+                            )
+                            results.append(entry)
+                            continue
                     elif s == "blocked":
                         ok = kanban_db.block_task(conn, tid)
                     elif s == "review":

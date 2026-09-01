@@ -5376,6 +5376,324 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+class CompletionPersistenceError(RuntimeError):
+    """Raised when a claimed deliverable is not durably persisted before completion.
+
+    Fail-closed gate: activation ``CLAIMED_DELIVERABLE -> PERSISTENCE_VERIFIED ->
+    COMPLETE``. Runs inside the completion write transaction (before the
+    ``completed`` event and before ``_cleanup_workspace``), so a rejection rolls
+    back the status transition (task stays in-flight) and the scratch workspace is
+    left intact for bounded recovery; no human gate is required.
+    """
+
+
+def _declared_completion_artifacts(metadata: Optional[dict]) -> list[str]:
+    """Return the non-empty string artifact paths declared in ``metadata``."""
+    if not isinstance(metadata, dict):
+        return []
+    raw = metadata.get("artifacts")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(p).strip() for p in raw if isinstance(p, str) and str(p).strip()]
+
+
+def _claimed_changed_files(metadata: Optional[dict]) -> list[str]:
+    """Return claimed changed files from metadata — worker *claims*, never trusted."""
+    if not isinstance(metadata, dict):
+        return []
+    raw = metadata.get("changed_files")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(p).strip() for p in raw if isinstance(p, str) and str(p).strip()]
+
+
+def _git_has_local_changes(path: Path) -> bool:
+    """True when ``path``'s git repo has uncommitted working-tree changes."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "status", "--porcelain"],
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return False
+    if result.returncode != 0:
+        return False
+    return bool((result.stdout or "").strip())
+
+
+def _git_has_remote_refs(repo_root: Path) -> bool:
+    """True when the repo has at least one remote-tracking ref (``refs/remotes/*``)."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "for-each-ref", "--format=%(refname)", "refs/remotes"],
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return False
+    if result.returncode != 0:
+        return False
+    return bool((result.stdout or "").strip())
+
+
+def _git_ref_exists(repo_root: Path, ref: str) -> bool:
+    """True when ``ref`` resolves to a commit in ``repo_root`` (symbolic ok)."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0
+
+
+def _git_default_branch_ref(repo_root: Path) -> Optional[str]:
+    """Resolve the remote default-branch ref (``origin/HEAD`` → ``origin/main`` → ``origin/master``).
+
+    This is the shared upstream base a fresh worktree branch is seeded from. It
+    is used as the anchor against which the branch's own durable commits are
+    measured. Returns ``None`` when no remote default branch is tracked (a bare
+    checkout — see the fail-closed rule in :func:`_git_has_local_commit`).
+    """
+    for ref in ("origin/HEAD", "origin/main", "origin/master"):
+        if _git_ref_exists(repo_root, ref):
+            return ref
+    return None
+
+
+def _git_has_local_commit(repo_root: Path) -> bool:
+    """True when the branch carries a durable commit reachable from HEAD.
+
+    ``DURABLE_COMMIT_EXISTS`` invariant: a worker's commit on the expected branch
+    is durable evidence EVEN when it has already been pushed to the feature
+    remote. The previous check — ``rev-list --count HEAD --not --remotes`` —
+    reports 0 as soon as the worker pushes their branch, a false negative that
+    wrongly rejected pushed-but-legitimate work (acceptance: local commit, pushed
+    to feature remote → PASS).
+
+    We instead measure commits on HEAD that are NOT reachable from the shared
+    upstream base (the remote default branch): those belong to this branch's own
+    history, reachable from HEAD, whether already on the remote or not.
+
+        durable = (HEAD ⊄ remotes) OR (HEAD ⊄ default-branch)
+
+    The first clause keeps catching unpushed local commits; the second makes a
+    pushed feature commit count, while a bare seeded worktree (HEAD is exactly
+    origin/main) still yields 0 on both → false, so the gate stays fail-closed
+    for "only base/main commit exists" (acceptance → FAIL).
+
+    Fail-closed on a repo with no remote-tracking refs, or no resolvable default
+    branch: there the base HEAD and a worker's first commit are indistinguishable
+    (and a pushed-only remote gives no base to measure against), so commits are
+    NOT treated as proof of persisted work — uncommitted changes carry it instead.
+    Bounded and repo-local; never touches the network.
+    """
+    if not _git_has_remote_refs(repo_root):
+        return False
+    base_ref = _git_default_branch_ref(repo_root)
+    checks = ["--remotes"]
+    if base_ref is not None:
+        checks.append(base_ref)
+    for anchor in checks:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(repo_root), "rev-list", "--count", "HEAD", "--not", anchor],
+                capture_output=True,
+                text=True, encoding='utf-8', errors='replace',
+                timeout=30,
+                check=False,
+            )
+        except Exception:
+            continue
+        if result.returncode != 0:
+            continue
+        try:
+            if int((result.stdout or "0").strip() or "0") > 0:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _changed_file_resides_in_worktree(root: Path, claimed: str) -> bool:
+    """True when a claimed changed file resolves inside the worktree ``root``."""
+    p = Path(claimed).expanduser()
+    if not p.is_absolute():
+        p = root / p
+    try:
+        resolved = p.resolve()
+    except OSError:
+        resolved = p
+    try:
+        return resolved.is_relative_to(root)
+    except ValueError:
+        return False
+
+
+def _verify_completion_persistence(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    metadata: Optional[dict],
+) -> None:
+    """Deterministic completion-persistence gate.
+
+    Runs after scratch artifacts have been copied to durable attachment storage
+    and recorded, but before the ``completed`` event and ``_cleanup_workspace``.
+    Raises :class:`CompletionPersistenceError` (rolling back the completion) when
+    a CLAIMED deliverable has no durably-persisted realisation:
+
+    * **B. Research/design/doc artifacts** — every declared ``artifacts`` path
+      must exist, be readable/non-empty, and must NOT live only in ephemeral
+      scratch storage. A finished scratch artifact is re-homed to the task
+      attachment dir before this gate; a path still sitting under a managed
+      scratch root is the exact ``EPHEMERAL_WORKSPACE_DELIVERABLE_LOSS`` failure.
+    * **A. Mutating repo work** — a ``worktree`` task (or a card claiming
+      ``changed_files`` without a durable artifact carrier) must show a real,
+      persisted repo diff/commit on its claimed branch. Worker metadata is only
+      corroborated against live git state, never trusted on its own.
+    * **C. Pure observational** — no durable claim → no fabricated requirement.
+    """
+    task = get_task(conn, task_id)
+    if task is None:
+        return
+
+    declared = _declared_completion_artifacts(metadata)
+    claimed_files = _claimed_changed_files(metadata)
+
+    # --- Class B: research/design/doc artifact ----------
+    if declared:
+        for art in declared:
+            p = Path(art).expanduser()
+            if not p.is_file():
+                raise CompletionPersistenceError(
+                    f"declared artifact is missing (file does not exist): {art}"
+                )
+            try:
+                size = p.stat().st_size
+            except OSError:
+                raise CompletionPersistenceError(
+                    f"declared artifact is not readable: {art}"
+                )
+            if size == 0:
+                raise CompletionPersistenceError(
+                    f"declared artifact is empty (no content persisted): {art}"
+                )
+            is_managed, _board = _managed_scratch_path_info(p)
+            if is_managed:
+                # A finished scratch artifact is copied out of the managed
+                # scratch root into the task attachment dir before this gate.
+                # If metadata still names a managed-scratch path, the copy did
+                # not happen and cleanup would destroy the deliverable.
+                raise CompletionPersistenceError(
+                    "declared artifact survives only in ephemeral scratch storage "
+                    f"(will be deleted by workspace cleanup): {art}. "
+                    "Re-declare it via kanban_complete(artifacts=[...]) so the "
+                    "completion copies it into durable attachment storage first."
+                )
+
+    # --- Class A: mutating repo work ---------------------
+    is_repo_task = task.workspace_kind == "worktree"
+    claims_code = bool(claimed_files)
+    if is_repo_task or claims_code:
+        _verify_repo_deliverable(task, declared, claimed_files, is_repo_task, claims_code)
+
+
+def _verify_repo_deliverable(
+    task: "Task",
+    declared: list[str],
+    claimed_files: list[str],
+    is_repo_task: bool,
+    claims_code: bool,
+) -> None:
+    """Fail-closed check that repo work is durably persisted on its branch."""
+    # A non-worktree card claiming changed_files with no durable artifact
+    # carrier is the classic scratch-loss: claim with no durable realisation.
+    if not is_repo_task and not declared:
+        raise CompletionPersistenceError(
+            "claimed changed_files but the task has no durable carrier for the "
+            f"work (no git worktree repo, no declared artifact): {task.id}. "
+            "Persist the implementation into a git worktree branch or ship the "
+            "deliverable via kanban_complete(artifacts=[...]) so it survives "
+            "workspace cleanup."
+        )
+
+    if is_repo_task:
+        ws_path = task.workspace_path
+        if not ws_path:
+            raise CompletionPersistenceError(
+                f"implementation task {task.id} has no persisted repo worktree path"
+            )
+        ws = Path(ws_path).expanduser()
+        if not ws.is_dir():
+            raise CompletionPersistenceError(
+                f"implementation worktree missing on disk: {ws}"
+            )
+        repo_root = _git_toplevel(ws)
+        if repo_root is None:
+            raise CompletionPersistenceError(
+                f"implementation workspace is not inside a git repo: {ws}"
+            )
+        # Claimed feature branch must be real (on the current checkout or as a ref).
+        branch = (task.branch_name or "").strip()
+        expects_repo_diff = is_repo_task and claims_code
+        if branch:
+            current = _git_current_branch(ws)
+            # Acceptance #5: wrong branch/worktree -> FAIL. For claimed repo
+            # implementation the completion must be on the exact declared
+            # branch — evidence from a different checkout/branch is not the
+            # deliverable (detached or another branch -> fail, even if the
+            # declared branch exists as a ref).
+            if expects_repo_diff and (current is None or current != branch):
+                raise CompletionPersistenceError(
+                    f"claimed implementation must be completed on the declared "
+                    f"branch {branch} (HEAD is on {current or 'detached'}); "
+                    f"wrong branch/worktree cannot satisfy the persistence gate"
+                )
+            if current is None or current != branch:
+                if branch not in (current or "") and not _git_branch_exists(repo_root, branch):
+                    raise CompletionPersistenceError(
+                        f"claimed feature branch {branch} was not persisted "
+                        f"(HEAD is on {current or 'detached'})"
+                    )
+        # Persisted diff/commit — the durable realization of repo work. Only
+        # required when an implementation is CLAIMED (changed_files metadata);
+        # a worktree card that claims nothing (pure observational, or ships its
+        # deliverable as a declared artifact) must not have a fabricated repo
+        # requirement (Class C). Fail condition is exactly: claimed
+        # implementation + zero persisted diff/commit.
+        if expects_repo_diff:
+            has_local = _git_has_local_changes(ws)
+            has_commit = _git_has_local_commit(repo_root)
+            if not has_local and not has_commit:
+                raise CompletionPersistenceError(
+                    "claimed implementation has zero persisted diff/commit in the "
+                    f"repo (clean tree, no commit ahead of base on {branch or 'HEAD'}). "
+                    "Commit the work (or keep uncommitted changes) in the worktree "
+                    "so it persists across workspace cleanup — or ship the "
+                    "deliverable as a declared artifact."
+                )
+        # Corroborate claimed changed_files against the real worktree — worker
+        # metadata is never trusted alone.
+        if claimed_files:
+            ws_root = ws.resolve()
+            ok = any(_changed_file_resides_in_worktree(ws_root, f) for f in claimed_files)
+            if not ok:
+                raise CompletionPersistenceError(
+                    "claimed changed_files do not resolve to any file in the repo "
+                    f"worktree {ws}: {', '.join(claimed_files)}"
+                )
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5515,6 +5833,14 @@ def complete_task(
                     size=path.stat().st_size,
                     created_at=now,
                 )
+        # Deterministic completion-persistence gate (P0 EPHEMERAL workspace
+        # deliverable loss). Runs AFTER scratch artifacts are copied to durable
+        # attachment storage but BEFORE the ``completed`` event and workspace
+        # cleanup, so a fail-closed rejection rolls back this transaction and the
+        # task stays in-flight with its workspace preserved for bounded recovery.
+        # ``EXECUTOR_FINISHED != DELIVERABLE_PERSISTED`` — a CLAIMED deliverable
+        # must be verified persistent before DONE.
+        _verify_completion_persistence(conn, task_id, metadata=metadata)
         run_id = _end_run(
             conn, task_id,
             outcome="completed", status="done",
@@ -8135,6 +8461,13 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    skipped_destructive_gate: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, class)`` ready tasks deferred this tick by the optional
+    pre-action destructive gate (``kanban.destructive_gate``). A card that
+    signals a destructive/irreversible action on a LIVE resource and has no
+    recorded human GO stays ``ready`` (never claimed / spawned) until a human
+    records the canonical GO comment. This is the pre-action gate: the
+    destructive action cannot start without prior human consent."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -9946,6 +10279,31 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+def _destructive_gate_requires_go(conn, task_id, *, board=None, strict: bool = False, allowlist=None):
+    """Return ``(cls, reason)`` to block a ready destructive-live card, or
+    ``None`` to allow it. Deterministic + read-only; called only when
+    ``kanban.destructive_gate`` is enabled. Heavy logic lives in
+    ``hermes_cli.destructive_gate``.
+
+    ``None`` means: allow (card is not destructive-live, or a human GO comment
+    is recorded). A tuple means DESTRUCTIVE_LIVE -> the caller leaves the card
+    ``ready`` (no claim/spawn) and re-evaluates next tick until a human records
+    the canonical GO comment. This is the pre-action gate: the destructive
+    action is blocked from starting before human consent.
+    """
+    try:
+        from hermes_cli.destructive_gate import destructive_gate_requires_go as _dg_eval
+    except Exception as exc:
+        return ("DESTRUCTIVE_LIVE", f"destructive_gate unavailable: {exc}")
+    try:
+        return _dg_eval(conn, task_id, board=board, strict=strict, allowlist=allowlist)
+    except Exception as exc:
+        # Fail-safe: the gate must never crash the dispatch tick. Any
+        # unexpected error blocks (require human GO), never lets a possibly
+        # destructive live action through.
+        return ("DESTRUCTIVE_LIVE", f"destructive_gate evaluate error: {exc}")
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -9960,6 +10318,9 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    destructive_gate: bool = False,
+    destructive_strict: bool = False,
+    destructive_allowlist=None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -9995,6 +10356,9 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            destructive_gate=destructive_gate,
+            destructive_strict=destructive_strict,
+            destructive_allowlist=destructive_allowlist,
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
@@ -10015,6 +10379,9 @@ def dispatch_once(
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
                 reconcile_orphans=reconcile_orphans,
+                destructive_gate=destructive_gate,
+                destructive_strict=destructive_strict,
+                destructive_allowlist=destructive_allowlist,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -10042,6 +10409,9 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    destructive_gate: bool = False,
+    destructive_strict: bool = False,
+    destructive_allowlist=None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -10081,6 +10451,15 @@ def _dispatch_once_locked(
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
+
+    if destructive_gate:
+        try:
+            from hermes_cli.destructive_gate import compile_allowlist
+            destructive_allowlist = compile_allowlist(destructive_allowlist)
+        except Exception:
+            # A malformed allowlist must never widen access; dispatch still
+            # proceeds with the gate and no benign-operation exception.
+            destructive_allowlist = []
 
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
@@ -10356,6 +10735,26 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
+        if destructive_gate:
+            _dg = _destructive_gate_requires_go(
+                conn,
+                row["id"],
+                board=board,
+                strict=destructive_strict,
+                allowlist=destructive_allowlist,
+            )
+            if _dg is not None:
+                cls_, reason = _dg
+                result.skipped_destructive_gate.append((row["id"], cls_))
+                # Emit a diagnostic event so operators can see why the card
+                # stayed ready without guessing. Never mutates claim state.
+                if not dry_run:
+                    with write_txn(conn):
+                        _append_event(
+                            conn, row["id"], "destructive_gate_held",
+                            {"class": cls_, "reason": reason},
+                        )
+                continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             spawned += 1

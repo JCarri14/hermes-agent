@@ -1314,6 +1314,15 @@ class GatewayKanbanWatchersMixin:
                 "kanban dispatcher: disabled via config kanban.dispatch_in_gateway=false"
             )
             return
+        # Productive boards force the pre-action gate on with strict
+        # classification; other boards retain the explicit opt-in.
+        destructive_gate = bool(kanban_cfg.get("destructive_gate", False))
+        productive_boards = kanban_cfg.get("productive_boards", [])
+        if not isinstance(productive_boards, list):
+            productive_boards = []
+        destructive_allowlist = kanban_cfg.get("destructive_allowlist", [])
+        if destructive_gate:
+            logger.info("kanban dispatcher: destructive_gate=on")
 
         try:
             from hermes_cli import kanban_db as _kb
@@ -1573,6 +1582,9 @@ class GatewayKanbanWatchersMixin:
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     reconcile_orphans=reconcile_orphans,
+                    destructive_gate=destructive_gate or slug in productive_boards,
+                    destructive_strict=slug in productive_boards,
+                    destructive_allowlist=destructive_allowlist,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
