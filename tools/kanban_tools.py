@@ -779,6 +779,21 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"scratch workspace was kept. Fix the artifact path or "
                     f"storage error, then retry kanban_complete with the same handoff."
                 )
+            except kb.CompletionPersistenceError as persist_err:
+                # Deterministic persistence gate (P0): a CLAIMED deliverable
+                # (scratch artifact or repo diff/commit) was not verified durably
+                # persisted. The completion transaction was rolled back — the task
+                # stays in-flight, no "completed" event landed, and the scratch
+                # workspace was NOT cleaned up. Bounded recovery: fix the
+                # deliverable and retry with the same handoff.
+                return tool_error(
+                    f"kanban_complete blocked by the persistence gate: {persist_err}. "
+                    f"The task is still in-flight and the completion was rolled "
+                    f"back (no state change, workspace preserved). Persist the "
+                    f"deliverable durably (commit the work in the worktree branch, "
+                    f"or re-declare the artifact via artifacts=[...] so it is "
+                    f"copied to durable storage), then retry kanban_complete."
+                )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
                 # worker can retry with a corrected list or drop the

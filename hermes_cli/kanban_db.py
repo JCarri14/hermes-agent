@@ -5376,6 +5376,262 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+class CompletionPersistenceError(RuntimeError):
+    """Raised when a claimed deliverable is not durably persisted before completion.
+
+    Fail-closed gate: activation ``CLAIMED_DELIVERABLE -> PERSISTENCE_VERIFIED ->
+    COMPLETE``. Runs inside the completion write transaction (before the
+    ``completed`` event and before ``_cleanup_workspace``), so a rejection rolls
+    back the status transition (task stays in-flight) and the scratch workspace is
+    left intact for bounded recovery; no human gate is required.
+    """
+
+
+def _declared_completion_artifacts(metadata: Optional[dict]) -> list[str]:
+    """Return the non-empty string artifact paths declared in ``metadata``."""
+    if not isinstance(metadata, dict):
+        return []
+    raw = metadata.get("artifacts")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(p).strip() for p in raw if isinstance(p, str) and str(p).strip()]
+
+
+def _claimed_changed_files(metadata: Optional[dict]) -> list[str]:
+    """Return claimed changed files from metadata — worker *claims*, never trusted."""
+    if not isinstance(metadata, dict):
+        return []
+    raw = metadata.get("changed_files")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(p).strip() for p in raw if isinstance(p, str) and str(p).strip()]
+
+
+def _git_has_local_changes(path: Path) -> bool:
+    """True when ``path``'s git repo has uncommitted working-tree changes."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "status", "--porcelain"],
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return False
+    if result.returncode != 0:
+        return False
+    return bool((result.stdout or "").strip())
+
+
+def _git_has_remote_refs(repo_root: Path) -> bool:
+    """True when the repo has at least one remote-tracking ref (``refs/remotes/*``)."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "for-each-ref", "--format=%(refname)", "refs/remotes"],
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return False
+    if result.returncode != 0:
+        return False
+    return bool((result.stdout or "").strip())
+
+
+def _git_has_local_commit(repo_root: Path) -> bool:
+    """True when HEAD has commits not reachable from any remote-tracking ref.
+
+    A freshly created worktree branch starts at the base's HEAD (already pinned
+    by a remote ref). Any commit made on the branch moves HEAD past every remote
+    tip, so ``--not --remotes`` turns nonzero — the deterministic sign that the
+    branch carries persisted work. Bounded and repo-local; never touches network.
+
+    Fail-closed on a repo with NO remote-tracking refs: there the base HEAD and
+    a worker's first commit are indistinguishable, so commits are NOT treated as
+    proof of persisted work (uncommitted changes must carry it instead).
+    """
+    if not _git_has_remote_refs(repo_root):
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-list", "--count", "HEAD", "--not", "--remotes"],
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return False
+    if result.returncode != 0:
+        return False
+    try:
+        return int((result.stdout or "0").strip() or "0") > 0
+    except ValueError:
+        return False
+
+
+def _changed_file_resides_in_worktree(root: Path, claimed: str) -> bool:
+    """True when a claimed changed file resolves inside the worktree ``root``."""
+    p = Path(claimed).expanduser()
+    if not p.is_absolute():
+        p = root / p
+    try:
+        resolved = p.resolve()
+    except OSError:
+        resolved = p
+    try:
+        return resolved.is_relative_to(root)
+    except ValueError:
+        return False
+
+
+def _verify_completion_persistence(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    metadata: Optional[dict],
+) -> None:
+    """Deterministic completion-persistence gate.
+
+    Runs after scratch artifacts have been copied to durable attachment storage
+    and recorded, but before the ``completed`` event and ``_cleanup_workspace``.
+    Raises :class:`CompletionPersistenceError` (rolling back the completion) when
+    a CLAIMED deliverable has no durably-persisted realisation:
+
+    * **B. Research/design/doc artifacts** — every declared ``artifacts`` path
+      must exist, be readable/non-empty, and must NOT live only in ephemeral
+      scratch storage. A finished scratch artifact is re-homed to the task
+      attachment dir before this gate; a path still sitting under a managed
+      scratch root is the exact ``EPHEMERAL_WORKSPACE_DELIVERABLE_LOSS`` failure.
+    * **A. Mutating repo work** — a ``worktree`` task (or a card claiming
+      ``changed_files`` without a durable artifact carrier) must show a real,
+      persisted repo diff/commit on its claimed branch. Worker metadata is only
+      corroborated against live git state, never trusted on its own.
+    * **C. Pure observational** — no durable claim → no fabricated requirement.
+    """
+    task = get_task(conn, task_id)
+    if task is None:
+        return
+
+    declared = _declared_completion_artifacts(metadata)
+    claimed_files = _claimed_changed_files(metadata)
+
+    # --- Class B: research/design/doc artifact ----------
+    if declared:
+        for art in declared:
+            p = Path(art).expanduser()
+            if not p.is_file():
+                raise CompletionPersistenceError(
+                    f"declared artifact is missing (file does not exist): {art}"
+                )
+            try:
+                size = p.stat().st_size
+            except OSError:
+                raise CompletionPersistenceError(
+                    f"declared artifact is not readable: {art}"
+                )
+            if size == 0:
+                raise CompletionPersistenceError(
+                    f"declared artifact is empty (no content persisted): {art}"
+                )
+            is_managed, _board = _managed_scratch_path_info(p)
+            if is_managed:
+                # A finished scratch artifact is copied out of the managed
+                # scratch root into the task attachment dir before this gate.
+                # If metadata still names a managed-scratch path, the copy did
+                # not happen and cleanup would destroy the deliverable.
+                raise CompletionPersistenceError(
+                    "declared artifact survives only in ephemeral scratch storage "
+                    f"(will be deleted by workspace cleanup): {art}. "
+                    "Re-declare it via kanban_complete(artifacts=[...]) so the "
+                    "completion copies it into durable attachment storage first."
+                )
+
+    # --- Class A: mutating repo work ---------------------
+    is_repo_task = task.workspace_kind == "worktree"
+    claims_code = bool(claimed_files)
+    if is_repo_task or claims_code:
+        _verify_repo_deliverable(task, declared, claimed_files, is_repo_task, claims_code)
+
+
+def _verify_repo_deliverable(
+    task: "Task",
+    declared: list[str],
+    claimed_files: list[str],
+    is_repo_task: bool,
+    claims_code: bool,
+) -> None:
+    """Fail-closed check that repo work is durably persisted on its branch."""
+    # A non-worktree card claiming changed_files with no durable artifact
+    # carrier is the classic scratch-loss: claim with no durable realisation.
+    if not is_repo_task and not declared:
+        raise CompletionPersistenceError(
+            "claimed changed_files but the task has no durable carrier for the "
+            f"work (no git worktree repo, no declared artifact): {task.id}. "
+            "Persist the implementation into a git worktree branch or ship the "
+            "deliverable via kanban_complete(artifacts=[...]) so it survives "
+            "workspace cleanup."
+        )
+
+    if is_repo_task:
+        ws_path = task.workspace_path
+        if not ws_path:
+            raise CompletionPersistenceError(
+                f"implementation task {task.id} has no persisted repo worktree path"
+            )
+        ws = Path(ws_path).expanduser()
+        if not ws.is_dir():
+            raise CompletionPersistenceError(
+                f"implementation worktree missing on disk: {ws}"
+            )
+        repo_root = _git_toplevel(ws)
+        if repo_root is None:
+            raise CompletionPersistenceError(
+                f"implementation workspace is not inside a git repo: {ws}"
+            )
+        # Claimed feature branch must be real (on the current checkout or as a ref).
+        branch = (task.branch_name or "").strip()
+        if branch:
+            current = _git_current_branch(ws)
+            if current is None or current != branch:
+                if branch not in (current or "") and not _git_branch_exists(repo_root, branch):
+                    raise CompletionPersistenceError(
+                        f"claimed feature branch {branch} was not persisted "
+                        f"(HEAD is on {current or 'detached'})"
+                    )
+        # Persisted diff/commit — the durable realization of repo work. Only
+        # required when an implementation is CLAIMED (changed_files metadata);
+        # a worktree card that claims nothing (pure observational, or ships its
+        # deliverable as a declared artifact) must not have a fabricated repo
+        # requirement (Class C). Fail condition is exactly: claimed
+        # implementation + zero persisted diff/commit.
+        expects_repo_diff = is_repo_task and claims_code
+        if expects_repo_diff:
+            has_local = _git_has_local_changes(ws)
+            has_commit = _git_has_local_commit(repo_root)
+            if not has_local and not has_commit:
+                raise CompletionPersistenceError(
+                    "claimed implementation has zero persisted diff/commit in the "
+                    f"repo (clean tree, no commit ahead of base on {branch or 'HEAD'}). "
+                    "Commit the work (or keep uncommitted changes) in the worktree "
+                    "so it persists across workspace cleanup — or ship the "
+                    "deliverable as a declared artifact."
+                )
+        # Corroborate claimed changed_files against the real worktree — worker
+        # metadata is never trusted alone.
+        if claimed_files:
+            ws_root = ws.resolve()
+            ok = any(_changed_file_resides_in_worktree(ws_root, f) for f in claimed_files)
+            if not ok:
+                raise CompletionPersistenceError(
+                    "claimed changed_files do not resolve to any file in the repo "
+                    f"worktree {ws}: {', '.join(claimed_files)}"
+                )
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5515,6 +5771,14 @@ def complete_task(
                     size=path.stat().st_size,
                     created_at=now,
                 )
+        # Deterministic completion-persistence gate (P0 EPHEMERAL workspace
+        # deliverable loss). Runs AFTER scratch artifacts are copied to durable
+        # attachment storage but BEFORE the ``completed`` event and workspace
+        # cleanup, so a fail-closed rejection rolls back this transaction and the
+        # task stays in-flight with its workspace preserved for bounded recovery.
+        # ``EXECUTOR_FINISHED != DELIVERABLE_PERSISTED`` — a CLAIMED deliverable
+        # must be verified persistent before DONE.
+        _verify_completion_persistence(conn, task_id, metadata=metadata)
         run_id = _end_run(
             conn, task_id,
             outcome="completed", status="done",

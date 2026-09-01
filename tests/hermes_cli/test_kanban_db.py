@@ -612,6 +612,182 @@ def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     ]
 
 
+# ---------------------------------------------------------------------------
+# Deterministic completion-persistence gate (P0 EPHEMERAL_WORKSPACE_DELIVERABLE_LOSS)
+# ---------------------------------------------------------------------------
+
+
+def _init_git_repo_with_remote(repo: Path) -> None:
+    """Init ``repo`` on ``main`` and pin ``refs/remotes/origin/main`` to its HEAD.
+
+    Establishes the remote-tracking ref WITHOUT a real push (this environment's
+    pre-push governance gate rejects pushes to non-allowlisted remotes, and a
+    push is not needed for the gate's local checks). Pinning ``origin/main`` to
+    the base commit makes ``_git_has_local_commit``'s ``--not --remotes`` check
+    meaningful: the base is pinned, so only genuine worker commits count.
+    """
+    _init_git_repo(repo)
+    subprocess.run(
+        ["git", "-C", str(repo), "update-ref", "refs/remotes/origin/main", "HEAD"],
+        check=True, capture_output=True, text=True,
+    )
+
+
+def test_complete_worktree_code_persisted_passes(kanban_home, tmp_path):
+    """Code mutation persisted in a repo worktree completes without blocking."""
+    repo = tmp_path / "repo"
+    _init_git_repo_with_remote(repo)
+    (repo / "code.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="implement feature", workspace_kind="worktree",
+            workspace_path=str(repo), branch_name="main",
+        )
+        assert kb.complete_task(
+            conn, t, result="done",
+            metadata={"changed_files": ["code.py"]},
+        ) is True
+        assert kb.get_task(conn, t).status == "done"
+
+
+def test_complete_worktree_committed_work_passes(kanban_home, tmp_path):
+    """A commit on the branch ahead of the remote base satisfies the gate."""
+    repo = tmp_path / "repo"
+    _init_git_repo_with_remote(repo)
+    (repo / "code.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "code.py"], check=True,
+                   capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "implement feature"],
+                   check=True, capture_output=True, text=True)
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="implement feature", workspace_kind="worktree",
+            workspace_path=str(repo), branch_name="main",
+        )
+        assert kb.complete_task(
+            conn, t, result="done",
+            metadata={"changed_files": ["code.py"]},
+        ) is True
+        assert kb.get_task(conn, t).status == "done"
+
+
+def test_complete_worktree_code_claimed_not_persisted_fails(kanban_home, tmp_path):
+    """Claimed implementation with zero persisted diff/commit is rejected."""
+    repo = tmp_path / "repo"
+    _init_git_repo_with_remote(repo)  # clean tree, no commit ahead
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="implement feature", workspace_kind="worktree",
+            workspace_path=str(repo), branch_name="main",
+        )
+        with pytest.raises(kb.CompletionPersistenceError) as exc:
+            kb.complete_task(
+                conn, t, result="done",
+                metadata={"changed_files": ["code.py"]},
+            )
+        assert "zero persisted diff/commit" in str(exc.value)
+        # Fail-closed: task NOT done, no workspace cleanup ran.
+        assert kb.get_task(conn, t).status != "done"
+        assert repo.is_dir()
+
+
+def test_complete_scratch_card_claims_code_without_carrier_fails(kanban_home):
+    """A scratch card claiming changed_files with no durable carrier is rejected."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="implement in scratch")
+        with pytest.raises(kb.CompletionPersistenceError) as exc:
+            kb.complete_task(
+                conn, t, result="done",
+                metadata={"changed_files": ["_tmp_/impl.py", "src/x.py"]},
+            )
+        assert "no durable carrier" in str(exc.value)
+        assert kb.get_task(conn, t).status != "done"
+
+
+def test_complete_research_artifact_persisted_passes(kanban_home):
+    """A research artifact re-homed to durable attachment storage passes the gate."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="research baseline")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        artifact = ws / "CURRENT_STATE_BASELINE.md"
+        artifact.write_text("# baseline\ncontent\n", encoding="utf-8")
+
+        assert kb.complete_task(
+            conn, t, result="done",
+            metadata={"artifacts": [str(artifact)]},
+        ) is True
+        assert kb.get_task(conn, t).status == "done"
+        # The re-homed durable copy survived scratch cleanup.
+        completed = [e for e in kb.list_events(conn, t) if e.kind == "completed"][-1]
+        persisted = Path(completed.payload["artifacts"][0])
+    assert not ws.exists()
+    assert persisted.exists()
+    assert persisted.read_text(encoding="utf-8") == "# baseline\ncontent\n"
+
+
+def test_complete_artifact_that_only_survives_in_scratch_fails(kanban_home, tmp_path):
+    """A declared artifact still living in managed scratch storage blocks completion.
+
+    A ``dir``-workspace task does not re-home scratch artifacts, so an artifact
+    path that points into the managed scratch root is never copied — the exact
+    EPHEMERAL_WORKSPACE_DELIVERABLE_LOSS pattern must fail closed.
+    """
+    durable = tmp_path / "durable"
+    durable.mkdir(parents=True, exist_ok=True)
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="research", workspace_kind="dir",
+            workspace_path=str(durable),
+        )
+        scratch_root = kb.workspaces_root(board=kb.get_current_board())
+        lost = scratch_root / "some-other-task" / "CURRENT_STATE_BASELINE.md"
+        lost.parent.mkdir(parents=True, exist_ok=True)
+        lost.write_text("baseline\n", encoding="utf-8")
+
+        with pytest.raises(kb.CompletionPersistenceError) as exc:
+            kb.complete_task(
+                conn, t, result="done",
+                metadata={"artifacts": [str(lost)]},
+            )
+        assert "ephemeral scratch storage" in str(exc.value)
+        assert kb.get_task(conn, t).status != "done"
+
+
+def test_complete_pure_observational_passes_without_durable_claim(kanban_home):
+    """No durable claim → no fabricated persistence requirement (Class C)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="observational check")
+        assert kb.complete_task(conn, t, result="all green") is True
+        assert kb.get_task(conn, t).status == "done"
+
+
+def test_complete_persistence_failure_preserves_workspace(kanban_home):
+    """Persistence failure → no DONE + workspace preserved for bounded recovery."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="render chart")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        artifact = ws / "chart.png"
+        artifact.write_bytes(b"png-bytes")
+        # Delete the artifact just before completion mimics a storage failure
+        # mid-persist: the declared file no longer exists.
+        artifact.unlink()
+
+        with pytest.raises(kb.ArtifactPreservationError):
+            kb.complete_task(
+                conn, t, result="done",
+                metadata={"artifacts": [str(artifact)]},
+            )
+        assert kb.get_task(conn, t).status != "done"
+    assert ws.exists(), "failed persistence must preserve the workspace for recovery"
+
+
 
 
 # ---------------------------------------------------------------------------

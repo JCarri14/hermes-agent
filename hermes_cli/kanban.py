@@ -2292,13 +2292,33 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 continue
 
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                ok = kb.complete_task(
+                    conn, tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+            except kb.CompletionPersistenceError as persist_err:
+                failed.append(tid)
+                print(
+                    f"kanban: persistence gate blocked completion of {tid}: "
+                    f"{persist_err}. Task is still in-flight and its workspace "
+                    f"was preserved; fix the deliverable and retry.",
+                    file=sys.stderr,
+                )
+                continue
+            except kb.ArtifactPreservationError as artifact_err:
+                failed.append(tid)
+                print(
+                    f"kanban: could not preserve declared artifacts for {tid}: "
+                    f"{artifact_err}. Task is still in-flight and its workspace "
+                    f"was kept; fix the artifact path and retry.",
+                    file=sys.stderr,
+                )
+                continue
+            if not ok:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
