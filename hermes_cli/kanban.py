@@ -2667,6 +2667,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         # fallback the gateway-embedded dispatcher applies, so behaviour
         # matches regardless of which path runs the tick.
         max_in_progress = kb.resolve_max_in_progress(max_in_progress)
+        conflict_gate = bool(_kanban_cfg.get("conflict_gate", False))
         # Productive boards force the pre-action gate on and use strict
         # classification. Other boards retain the existing opt-in behavior.
         productive_boards = _kanban_cfg.get("productive_boards", [])
@@ -2686,6 +2687,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         default_assignee = None
         max_in_progress_per_profile = None
         max_in_progress = None
+        conflict_gate = False
         destructive_gate = False
         destructive_strict = False
         destructive_allowlist = []
@@ -2699,6 +2701,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            conflict_gate=conflict_gate,
             destructive_gate=destructive_gate,
             destructive_strict=destructive_strict,
             destructive_allowlist=destructive_allowlist,
@@ -2722,6 +2725,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "skipped_conflict_serialized": [
+                {"task_id": tid, "class": cls_}
+                for (tid, cls_) in res.skipped_conflict_serialized
+            ],
             "skipped_destructive_gate": [
                 {"task_id": tid, "class": cls_}
                 for (tid, cls_) in res.skipped_destructive_gate
@@ -2762,6 +2769,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
+        )
+    if res.skipped_conflict_serialized:
+        print(
+            "Conflict gate (serialized, held ready): "
+            + ", ".join(f"{tid}[{cls_}]" for (tid, cls_) in res.skipped_conflict_serialized)
         )
     if res.skipped_destructive_gate:
         print(

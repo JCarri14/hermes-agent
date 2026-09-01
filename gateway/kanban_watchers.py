@@ -1314,6 +1314,9 @@ class GatewayKanbanWatchersMixin:
                 "kanban dispatcher: disabled via config kanban.dispatch_in_gateway=false"
             )
             return
+        conflict_gate = bool(kanban_cfg.get("conflict_gate", False))
+        if conflict_gate:
+            logger.info("kanban dispatcher: conflict_gate=on")
         # Productive boards force the pre-action gate on with strict
         # classification; other boards retain the explicit opt-in.
         destructive_gate = bool(kanban_cfg.get("destructive_gate", False))
@@ -1582,6 +1585,7 @@ class GatewayKanbanWatchersMixin:
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     reconcile_orphans=reconcile_orphans,
+                    conflict_gate=conflict_gate,
                     destructive_gate=destructive_gate or slug in productive_boards,
                     destructive_strict=slug in productive_boards,
                     destructive_allowlist=destructive_allowlist,

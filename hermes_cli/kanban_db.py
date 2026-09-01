@@ -8461,6 +8461,10 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    skipped_conflict_serialized: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, class)`` ready Developer tasks deferred by the optional,
+    deterministic conflict-admission gate. The card remains ``ready`` and is
+    re-evaluated after the active same-base Developer finishes."""
     skipped_destructive_gate: list[tuple[str, str]] = field(default_factory=list)
     """``(task_id, class)`` ready tasks deferred this tick by the optional
     pre-action destructive gate (``kanban.destructive_gate``). A card that
@@ -10279,6 +10283,56 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+def _conflict_gate_should_serialize(conn, task_id, assignee, *, board=None):
+    """Return ``(class, reason)`` to defer unsafe concurrent Developer work.
+
+    Any unavailable dependency or indeterminate inspection is fail-closed as
+    ``UNKNOWN``; the candidate remains ready and is retried later.
+    """
+    try:
+        from hermes_cli.conflict_gate import (
+            GateInput, evaluate, UNKNOWN, _resolve_gate_repo_root,
+            _parse_target_paths_manifest,
+        )
+    except Exception as exc:
+        return ("UNKNOWN", f"conflict_gate unavailable: {exc}")
+    try:
+        cand = conn.execute(
+            "SELECT id, project_id, branch_name, workspace_path FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        running = conn.execute(
+            "SELECT id, project_id, branch_name FROM tasks WHERE status='running' AND id != ?",
+            (task_id,),
+        ).fetchall()
+    except Exception as exc:
+        return (UNKNOWN, f"gate task lookup failed: {exc}")
+    if cand is None or cand["branch_name"] is None:
+        return (UNKNOWN, "gate candidate has no branch")
+    active_branches = [
+        row["branch_name"] for row in running
+        if cand["project_id"] and row["project_id"] == cand["project_id"] and row["branch_name"]
+    ]
+    if not active_branches:
+        return None
+    repo_root = _resolve_gate_repo_root(conn, task_id, cand, board=board)
+    if not repo_root:
+        return (UNKNOWN, "gate repo_root unavailable")
+    try:
+        verdict = evaluate(GateInput(
+            repo_root=repo_root,
+            base_ref="origin/dev",
+            active_branches=active_branches,
+            candidate_branch=cand["branch_name"],
+            candidate_manifest_paths=_parse_target_paths_manifest(conn, task_id),
+        ))
+    except Exception as exc:
+        return (UNKNOWN, f"gate evaluate error: {exc}")
+    if verdict.cls in (UNKNOWN, "SERIALIZE"):
+        return (verdict.cls, "; ".join(verdict.reasons))
+    return None
+
+
 def _destructive_gate_requires_go(conn, task_id, *, board=None, strict: bool = False, allowlist=None):
     """Return ``(cls, reason)`` to block a ready destructive-live card, or
     ``None`` to allow it. Deterministic + read-only; called only when
@@ -10318,6 +10372,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    conflict_gate: bool = False,
     destructive_gate: bool = False,
     destructive_strict: bool = False,
     destructive_allowlist=None,
@@ -10356,6 +10411,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            conflict_gate=conflict_gate,
             destructive_gate=destructive_gate,
             destructive_strict=destructive_strict,
             destructive_allowlist=destructive_allowlist,
@@ -10379,6 +10435,7 @@ def dispatch_once(
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
                 reconcile_orphans=reconcile_orphans,
+                conflict_gate=conflict_gate,
                 destructive_gate=destructive_gate,
                 destructive_strict=destructive_strict,
                 destructive_allowlist=destructive_allowlist,
@@ -10409,6 +10466,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    conflict_gate: bool = False,
     destructive_gate: bool = False,
     destructive_strict: bool = False,
     destructive_allowlist=None,
@@ -10713,6 +10771,20 @@ def _dispatch_once_locked(
                 result.skipped_per_profile_capped.append(
                     (row["id"], row_assignee, current)
                 )
+                continue
+        if conflict_gate:
+            conflict = _conflict_gate_should_serialize(
+                conn, row["id"], row_assignee, board=board,
+            )
+            if conflict is not None:
+                cls_, reason = conflict
+                result.skipped_conflict_serialized.append((row["id"], cls_))
+                if not dry_run:
+                    with write_txn(conn):
+                        _append_event(
+                            conn, row["id"], "conflict_serialized",
+                            {"class": cls_, "reason": reason},
+                        )
                 continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
