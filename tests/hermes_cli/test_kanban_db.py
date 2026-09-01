@@ -694,6 +694,43 @@ def test_complete_worktree_code_claimed_not_persisted_fails(kanban_home, tmp_pat
         assert repo.is_dir()
 
 
+def test_complete_worktree_wrong_current_branch_fails(kanban_home, tmp_path):
+    """A worktree checked out on a different branch than the declared one
+    cannot satisfy the persistence gate — even when the declared branch
+    exists as a ref (Acceptance #5: wrong branch/worktree -> FAIL).
+
+    Regression for the QA finding where ``_verify_repo_deliverable`` only
+    rejected a mismatched checkout when the declared branch did NOT exist as
+    a ref; with the branch present, evidence from the wrong branch was
+    accepted as the deliverable.
+    """
+    repo = tmp_path / "repo"
+    _init_git_repo_with_remote(repo)
+    # Create the declared target branch as a real ref so the old gate would
+    # have passed on ``_git_branch_exists`` alone.
+    subprocess.run(["git", "-C", str(repo), "branch", "feature/task"],
+                   check=True, capture_output=True, text=True)
+    # Checkout remains on the default branch (main), NOT on feature/task.
+    subprocess.run(["git", "-C", str(repo), "checkout", "main"],
+                   check=True, capture_output=True, text=True)
+    (repo / "code.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="implement feature", workspace_kind="worktree",
+            workspace_path=str(repo), branch_name="feature/task",
+        )
+        with pytest.raises(kb.CompletionPersistenceError) as exc:
+            kb.complete_task(
+                conn, t, result="done",
+                metadata={"changed_files": ["code.py"]},
+            )
+        assert "wrong branch" in str(exc.value) or "on the declared branch" in str(exc.value)
+        # Fail-closed: task NOT done, workspace preserved.
+        assert kb.get_task(conn, t).status != "done"
+        assert repo.is_dir()
+
+
 def test_complete_worktree_commit_pushed_to_feature_remote_passes(kanban_home, tmp_path):
     """A commit already pushed to the feature remote still satisfies the gate.
 

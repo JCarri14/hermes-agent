@@ -5645,8 +5645,20 @@ def _verify_repo_deliverable(
             )
         # Claimed feature branch must be real (on the current checkout or as a ref).
         branch = (task.branch_name or "").strip()
+        expects_repo_diff = is_repo_task and claims_code
         if branch:
             current = _git_current_branch(ws)
+            # Acceptance #5: wrong branch/worktree -> FAIL. For claimed repo
+            # implementation the completion must be on the exact declared
+            # branch — evidence from a different checkout/branch is not the
+            # deliverable (detached or another branch -> fail, even if the
+            # declared branch exists as a ref).
+            if expects_repo_diff and (current is None or current != branch):
+                raise CompletionPersistenceError(
+                    f"claimed implementation must be completed on the declared "
+                    f"branch {branch} (HEAD is on {current or 'detached'}); "
+                    f"wrong branch/worktree cannot satisfy the persistence gate"
+                )
             if current is None or current != branch:
                 if branch not in (current or "") and not _git_branch_exists(repo_root, branch):
                     raise CompletionPersistenceError(
@@ -5659,7 +5671,6 @@ def _verify_repo_deliverable(
         # deliverable as a declared artifact) must not have a fabricated repo
         # requirement (Class C). Fail condition is exactly: claimed
         # implementation + zero persisted diff/commit.
-        expects_repo_diff = is_repo_task and claims_code
         if expects_repo_diff:
             has_local = _git_has_local_changes(ws)
             has_commit = _git_has_local_commit(repo_root)
