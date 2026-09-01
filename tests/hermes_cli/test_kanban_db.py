@@ -694,6 +694,44 @@ def test_complete_worktree_code_claimed_not_persisted_fails(kanban_home, tmp_pat
         assert repo.is_dir()
 
 
+def test_complete_worktree_commit_pushed_to_feature_remote_passes(kanban_home, tmp_path):
+    """A commit already pushed to the feature remote still satisfies the gate.
+
+    Regression for ``_git_has_local_commit``'s false positive: once a worker
+    pushes their branch, ``rev-list --count HEAD --not --remotes`` turns 0 (the
+    tip is pinned by origin/feature), which used to reject legitimate pushed
+    work. The DURABLE_COMMIT_EXISTS invariant counts commits on HEAD beyond the
+    shared upstream base (origin/main), so pushed-but-real work passes.
+    """
+    repo = tmp_path / "repo"
+    _init_git_repo_with_remote(repo)  # origin/main pinned to the base
+    subprocess.run(["git", "-C", str(repo), "checkout", "-b", "feature/task"],
+                   check=True, capture_output=True, text=True)
+    (repo / "code.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "code.py"], check=True,
+                   capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "implement feature"],
+                   check=True, capture_output=True, text=True)
+    # Simulate the push: pin origin/feature to HEAD (pre-push governance gate
+    # blocks a real push in this env; pinning the remote-tracking ref has the
+    # same effect on the gate's local checks).
+    subprocess.run(
+        ["git", "-C", str(repo), "update-ref", "refs/remotes/origin/feature", "HEAD"],
+        check=True, capture_output=True, text=True,
+    )
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="implement feature", workspace_kind="worktree",
+            workspace_path=str(repo), branch_name="feature/task",
+        )
+        assert kb.complete_task(
+            conn, t, result="done",
+            metadata={"changed_files": ["code.py"]},
+        ) is True
+        assert kb.get_task(conn, t).status == "done"
+
+
 def test_complete_scratch_card_claims_code_without_carrier_fails(kanban_home):
     """A scratch card claiming changed_files with no durable carrier is rejected."""
     with kb.connect() as conn:

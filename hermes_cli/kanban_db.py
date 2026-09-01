@@ -5441,23 +5441,11 @@ def _git_has_remote_refs(repo_root: Path) -> bool:
     return bool((result.stdout or "").strip())
 
 
-def _git_has_local_commit(repo_root: Path) -> bool:
-    """True when HEAD has commits not reachable from any remote-tracking ref.
-
-    A freshly created worktree branch starts at the base's HEAD (already pinned
-    by a remote ref). Any commit made on the branch moves HEAD past every remote
-    tip, so ``--not --remotes`` turns nonzero — the deterministic sign that the
-    branch carries persisted work. Bounded and repo-local; never touches network.
-
-    Fail-closed on a repo with NO remote-tracking refs: there the base HEAD and
-    a worker's first commit are indistinguishable, so commits are NOT treated as
-    proof of persisted work (uncommitted changes must carry it instead).
-    """
-    if not _git_has_remote_refs(repo_root):
-        return False
+def _git_ref_exists(repo_root: Path, ref: str) -> bool:
+    """True when ``ref`` resolves to a commit in ``repo_root`` (symbolic ok)."""
     try:
         result = subprocess.run(
-            ["git", "-C", str(repo_root), "rev-list", "--count", "HEAD", "--not", "--remotes"],
+            ["git", "-C", str(repo_root), "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
             capture_output=True,
             text=True, encoding='utf-8', errors='replace',
             timeout=30,
@@ -5465,12 +5453,75 @@ def _git_has_local_commit(repo_root: Path) -> bool:
         )
     except Exception:
         return False
-    if result.returncode != 0:
+    return result.returncode == 0
+
+
+def _git_default_branch_ref(repo_root: Path) -> Optional[str]:
+    """Resolve the remote default-branch ref (``origin/HEAD`` → ``origin/main`` → ``origin/master``).
+
+    This is the shared upstream base a fresh worktree branch is seeded from. It
+    is used as the anchor against which the branch's own durable commits are
+    measured. Returns ``None`` when no remote default branch is tracked (a bare
+    checkout — see the fail-closed rule in :func:`_git_has_local_commit`).
+    """
+    for ref in ("origin/HEAD", "origin/main", "origin/master"):
+        if _git_ref_exists(repo_root, ref):
+            return ref
+    return None
+
+
+def _git_has_local_commit(repo_root: Path) -> bool:
+    """True when the branch carries a durable commit reachable from HEAD.
+
+    ``DURABLE_COMMIT_EXISTS`` invariant: a worker's commit on the expected branch
+    is durable evidence EVEN when it has already been pushed to the feature
+    remote. The previous check — ``rev-list --count HEAD --not --remotes`` —
+    reports 0 as soon as the worker pushes their branch, a false negative that
+    wrongly rejected pushed-but-legitimate work (acceptance: local commit, pushed
+    to feature remote → PASS).
+
+    We instead measure commits on HEAD that are NOT reachable from the shared
+    upstream base (the remote default branch): those belong to this branch's own
+    history, reachable from HEAD, whether already on the remote or not.
+
+        durable = (HEAD ⊄ remotes) OR (HEAD ⊄ default-branch)
+
+    The first clause keeps catching unpushed local commits; the second makes a
+    pushed feature commit count, while a bare seeded worktree (HEAD is exactly
+    origin/main) still yields 0 on both → false, so the gate stays fail-closed
+    for "only base/main commit exists" (acceptance → FAIL).
+
+    Fail-closed on a repo with no remote-tracking refs, or no resolvable default
+    branch: there the base HEAD and a worker's first commit are indistinguishable
+    (and a pushed-only remote gives no base to measure against), so commits are
+    NOT treated as proof of persisted work — uncommitted changes carry it instead.
+    Bounded and repo-local; never touches the network.
+    """
+    if not _git_has_remote_refs(repo_root):
         return False
-    try:
-        return int((result.stdout or "0").strip() or "0") > 0
-    except ValueError:
-        return False
+    base_ref = _git_default_branch_ref(repo_root)
+    checks = ["--remotes"]
+    if base_ref is not None:
+        checks.append(base_ref)
+    for anchor in checks:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(repo_root), "rev-list", "--count", "HEAD", "--not", anchor],
+                capture_output=True,
+                text=True, encoding='utf-8', errors='replace',
+                timeout=30,
+                check=False,
+            )
+        except Exception:
+            continue
+        if result.returncode != 0:
+            continue
+        try:
+            if int((result.stdout or "0").strip() or "0") > 0:
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def _changed_file_resides_in_worktree(root: Path, claimed: str) -> bool:
