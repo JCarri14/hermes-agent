@@ -45,6 +45,7 @@ import {
   taskKey,
   uploadAttachment
 } from './api'
+import { openSessionTile, patchSessionTile } from '@/store/session-states'
 import { ModelOverrideField, overridePatch } from './model-override'
 import {
   type Diagnostic,
@@ -72,6 +73,32 @@ import {
   useDefaultAssignee,
   useKanban
 } from './ui'
+
+function workerLaunchFromMetadata(metadata: unknown): null | { displayLabel?: string; sessionId: string } {
+  if (!metadata || typeof metadata !== 'object') {
+    return null
+  }
+
+  const launch = (metadata as { worker_launch?: unknown }).worker_launch
+
+  if (!launch || typeof launch !== 'object') {
+    return null
+  }
+
+  const sessionId = typeof (launch as { session_id?: unknown }).session_id === 'string'
+    ? ((launch as { session_id?: string }).session_id ?? '').trim()
+    : ''
+
+  if (!sessionId) {
+    return null
+  }
+
+  const displayLabel = typeof (launch as { display_label?: unknown }).display_label === 'string'
+    ? (launch as { display_label?: string }).display_label?.trim() || undefined
+    : undefined
+
+  return { displayLabel, sessionId }
+}
 
 /**
  * Turn a task_events row into an operator-readable line. The backend logs
@@ -902,6 +929,7 @@ export function TaskDrawer({
                   <ul className="flex flex-col gap-1.5">
                     {detail.runs.map(run => {
                       const failed = ['crashed', 'failed', 'timed_out', 'gave_up'].includes(run.outcome ?? run.status)
+                      const workerLaunch = workerLaunchFromMetadata(run.metadata)
 
                       return (
                         <li className="flex flex-col gap-0.5 text-[0.71rem]" key={run.id}>
@@ -914,6 +942,22 @@ export function TaskDrawer({
                               <span className="text-(--ui-text-quaternary)">
                                 {duration(run.started_at, run.ended_at)}
                               </span>
+                            )}
+                            {workerLaunch && (
+                              <Button
+                                className="h-5 px-1.5"
+                                onClick={() => {
+                                  openSessionTile(workerLaunch.sessionId, 'center')
+                                  if (workerLaunch.displayLabel) {
+                                    patchSessionTile(workerLaunch.sessionId, { titleOverride: workerLaunch.displayLabel })
+                                  }
+                                }}
+                                size="xs"
+                                variant="ghost"
+                              >
+                                <Codicon name="link-external" size="0.7rem" />
+                                {k.open}
+                              </Button>
                             )}
                             <span className="ml-auto shrink-0 text-(--ui-text-quaternary)">
                               {ago(run.ended_at ?? run.started_at)}

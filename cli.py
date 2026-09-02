@@ -4681,10 +4681,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Deferred title: stored in memory until the session is created in the DB
         self._pending_title: Optional[str] = None
         
-        # Session ID: reuse existing one when resuming, otherwise generate fresh
+        # Session ID: reuse existing one when resuming; otherwise honor an
+        # explicitly pre-seeded worker/session id when the launcher provided one,
+        # falling back to a fresh id for normal interactive use.
+        seeded_session_id = (os.environ.get("HERMES_SESSION_ID") or "").strip()
         if resume:
             self.session_id = resume
             self._resumed = True
+        elif seeded_session_id:
+            self.session_id = seeded_session_id
         else:
             timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
             short_uuid = uuid.uuid4().hex[:6]

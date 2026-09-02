@@ -323,6 +323,11 @@ export type TileDock = 'center' | SplitDir
 export interface SessionTile {
   /** Stored session id — the durable identity (runtime ids are ephemeral). */
   storedSessionId: string
+  /** Presentation-only label for sessions that are intentionally hidden from
+   *  normal recents/sidebar lists (delegate children, kanban workers). Never an
+   *  authority key: reconciliation, ownership, completion, and cleanup always
+   *  use the stored session id. */
+  titleOverride?: string
   /** Dock against `anchor` on adoption (default right; center = stack). */
   dir?: TileDock
   /** Pane to dock against (a drop's target zone) — default the workspace.
@@ -351,13 +356,14 @@ const TILE_PANE_PREFIX = 'session-tile:'
 /** Persisted placement — `dir` + strip slot (`before`) + dock `anchor` so a
  *  restart / profile swap re-adopts tiles in the same order, not all stacked
  *  right of workspace. */
-type StoredTile = Pick<SessionTile, 'anchor' | 'before' | 'dir' | 'storedSessionId'>
+type StoredTile = Pick<SessionTile, 'anchor' | 'before' | 'dir' | 'storedSessionId' | 'titleOverride'>
 
 const toStored = (t: SessionTile): StoredTile => ({
   anchor: t.anchor,
   before: t.before,
   dir: t.dir,
-  storedSessionId: t.storedSessionId
+  storedSessionId: t.storedSessionId,
+  titleOverride: t.titleOverride
 })
 
 function parseTileList(value: unknown): StoredTile[] {
@@ -371,7 +377,8 @@ function parseTileList(value: unknown): StoredTile[] {
             anchor: typeof raw.anchor === 'string' ? raw.anchor : undefined,
             before: typeof raw.before === 'string' || raw.before === null ? raw.before : undefined,
             dir: raw.dir,
-            storedSessionId: raw.storedSessionId
+            storedSessionId: raw.storedSessionId,
+            titleOverride: typeof raw.titleOverride === 'string' && raw.titleOverride.trim() ? raw.titleOverride : undefined
           }
         })
     : []
@@ -716,7 +723,13 @@ export function closeSessionTile(storedSessionId: string) {
   const tile = $sessionTiles.get().find(t => t.storedSessionId === storedSessionId)
 
   if (tile) {
-    closedStack().push({ anchor: tile.anchor, before: tile.before, dir: tile.dir, storedSessionId })
+    closedStack().push({
+      anchor: tile.anchor,
+      before: tile.before,
+      dir: tile.dir,
+      storedSessionId,
+      titleOverride: tile.titleOverride
+    })
   }
 
   saveTiles($sessionTiles.get().filter(t => t.storedSessionId !== storedSessionId))
@@ -752,6 +765,9 @@ export function reopenLastClosedTile(): void {
 
     if (!$sessionTiles.get().some(t => t.storedSessionId === storedSessionId)) {
       openSessionTile(storedSessionId, tile.dir, tile.anchor, tile.before)
+      if (tile.titleOverride) {
+        patchSessionTile(storedSessionId, { titleOverride: tile.titleOverride })
+      }
       focusOpenSession(storedSessionId)
 
       return

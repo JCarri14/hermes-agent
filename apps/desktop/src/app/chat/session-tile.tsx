@@ -376,10 +376,11 @@ export function tileStoredRow(storedSessionId: string): SessionInfo | undefined 
 
 function tileTitle(storedSessionId: string): string {
   const stored = tileStoredRow(storedSessionId)
+  const override = $sessionTiles.get().find(t => t.storedSessionId === storedSessionId)?.titleOverride?.trim()
 
   // A tab-strip "+" tab is unlisted until its first turn persists, so it isn't
   // in $sessions yet — label it "New session" rather than a bare "Session".
-  return stored ? sessionTitle(stored) : 'New session'
+  return override || (stored ? sessionTitle(stored) : 'New session')
 }
 
 /** The `@session` link payload for a tile tab drag — id + owning profile + title. */
@@ -588,6 +589,17 @@ export const watchSessionTiles = paneMirror<SessionTile>({
   tabLead: storedSessionId => (
     <SessionStatusDot session={tileStoredRow(storedSessionId)} storedSessionId={storedSessionId} />
   ),
+  // Until the first turn lists a row there is no title to register, so the tab
+  // takes its name from the composer instead — live, without re-registering.
+  tabTitle: storedSessionId => {
+    if (tileStoredRow(storedSessionId)) {
+      return null
+    }
+
+    const override = $sessionTiles.get().find(t => t.storedSessionId === storedSessionId)?.titleOverride?.trim()
+
+    return override || <SessionDraftTitle scope={storedSessionId} />
+  },
   render: storedSessionId => <SessionTilePane storedSessionId={storedSessionId} />,
   tabWrap: (storedSessionId, tab) => (
     <SessionTabMenu

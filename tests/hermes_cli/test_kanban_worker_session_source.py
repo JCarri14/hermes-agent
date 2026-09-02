@@ -53,13 +53,64 @@ def test_worker_spawn_tags_session_source_kanban(monkeypatch, tmp_path):
         claim_lock=None,
         claim_expires=None,
         tenant=None,
+        current_run_id=7,
     )
     workspace = str(tmp_path / "ws")
     os.makedirs(workspace, exist_ok=True)
 
-    kb._default_spawn(task, workspace)
+    launch = kb._default_spawn(task, workspace)
 
     assert captured["env"]["HERMES_SESSION_SOURCE"] == "kanban"
+    assert captured["env"]["HERMES_SESSION_ID"] == "kanban_t_b21733fb_run_7"
+    assert launch is not None
+    assert launch.session_id == "kanban_t_b21733fb_run_7"
+    assert launch.pid == 4321
+    assert launch.display_label == "run-7 · ship it"
+
+
+def test_worker_spawn_derives_deterministic_session_id_from_run(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+
+    captured = {}
+
+    class _Proc:
+        pid = 9876
+
+    def _fake_popen(cmd, **kwargs):
+        captured["env"] = kwargs["env"]
+        return _Proc()
+
+    monkeypatch.setattr("subprocess.Popen", _fake_popen)
+    monkeypatch.setattr(kb, "_retag_legacy_worker_sessions", lambda _root: None)
+    monkeypatch.setattr(kb, "worker_logs_dir", lambda board=None: tmp_path / "logs")
+
+    task = kb.Task(
+        id="t_card_123",
+        title="ERP-287 fix payment retry",
+        body=None,
+        assignee="default",
+        status="ready",
+        priority=0,
+        created_by=None,
+        created_at=0,
+        started_at=None,
+        completed_at=None,
+        workspace_kind="scratch",
+        workspace_path=None,
+        claim_lock=None,
+        claim_expires=None,
+        tenant=None,
+        current_run_id=41,
+    )
+    workspace = str(tmp_path / "ws2")
+    os.makedirs(workspace, exist_ok=True)
+
+    launch = kb._default_spawn(task, workspace)
+
+    assert launch is not None
+    assert launch.session_id == "kanban_t_card_123_run_41"
+    assert captured["env"]["HERMES_SESSION_ID"] == "kanban_t_card_123_run_41"
+    assert launch.display_label == "ERP-287 · ERP-287 fix payment retry"
 
 
 def test_kanban_rows_stay_out_of_the_session_list(db):

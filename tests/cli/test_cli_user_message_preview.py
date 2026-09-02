@@ -51,6 +51,12 @@ def _make_cli(user_message_preview=None):
 
 
 class TestSubmittedUserMessagePreview:
+    def test_cli_honors_preseeded_session_id_for_fresh_start(self):
+        with patch.dict("os.environ", {"HERMES_SESSION_ID": "kanban_t_demo_run_7"}, clear=False):
+            cli = _make_cli()
+
+        assert cli.session_id == "kanban_t_demo_run_7"
+
     def test_default_preview_shows_first_two_lines_and_last_two_lines(self):
         cli = _make_cli()
 

@@ -7,9 +7,13 @@ import { $selectedStoredSessionId } from '@/store/session'
 import type { SessionTile } from '@/store/session-states'
 import {
   blankDraftTile,
+  closeSessionTile,
   focusedSessionNeedsRoute,
   markSelectionRestore,
+  openSessionTile,
   orderTilesByTree,
+  patchSessionTile,
+  reopenLastClosedTile,
   selectionHomesToWorkspace
 } from '@/store/session-states'
 
@@ -136,6 +140,36 @@ describe('blankDraftTile', () => {
   it('is null when every open tab holds a conversation', () => {
     expect(blankDraftTile([bound('a', 'run-a')], { 'run-a': state(2) })).toBeNull()
     expect(blankDraftTile([], {})).toBeNull()
+  })
+})
+
+describe('visible-session tile semantics', () => {
+  beforeEach(() => {
+    window.localStorage.clear()
+    $selectedStoredSessionId.set('primary')
+  })
+
+  it('dedupes repeated opens for the same stored session id', () => {
+    openSessionTile('child-session', 'center', 'workspace')
+    openSessionTile('child-session', 'center', 'workspace')
+
+    expect(
+      new Set(
+        Array.from((window.localStorage.getItem('hermes.desktop.sessionTiles.v2') ?? '').matchAll(/child-session/g)).map(m => m[0])
+      ).size
+    ).toBe(1)
+  })
+
+  it('preserves a titleOverride across manual close and reopen', () => {
+    openSessionTile('worker-session', 'center', 'workspace')
+    patchSessionTile('worker-session', { titleOverride: 'run-7 · ship it' })
+
+    closeSessionTile('worker-session')
+    reopenLastClosedTile()
+
+    const stored = window.localStorage.getItem('hermes.desktop.sessionTiles.v2') ?? ''
+    expect(stored).toContain('run-7 · ship it')
+    expect(stored).toContain('worker-session')
   })
 })
 

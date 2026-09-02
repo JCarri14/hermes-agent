@@ -1144,6 +1144,31 @@ class Run:
         )
 
 
+@dataclass(frozen=True)
+class WorkerLaunchRecord:
+    """Canonical identity emitted by a worker launcher."""
+
+    pid: Optional[int] = None
+    session_id: Optional[str] = None
+    endpoint_id: Optional[str] = None
+    display_label: Optional[str] = None
+    cleanup_token: Optional[str] = None
+
+    def as_metadata(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if self.pid is not None:
+            payload["pid"] = int(self.pid)
+        if self.session_id:
+            payload["session_id"] = str(self.session_id)
+        if self.endpoint_id:
+            payload["endpoint_id"] = str(self.endpoint_id)
+        if self.display_label:
+            payload["display_label"] = str(self.display_label)
+        if self.cleanup_token:
+            payload["cleanup_token"] = str(self.cleanup_token)
+        return payload
+
+
 @dataclass
 class Comment:
     id: int
@@ -4039,6 +4064,7 @@ def _end_run(
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
+    merged_metadata = _merge_run_metadata_locked(conn, run_id, metadata)
     conn.execute(
         """
         UPDATE task_runs
@@ -4059,7 +4085,7 @@ def _end_run(
             outcome,
             summary,
             error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            json.dumps(merged_metadata, ensure_ascii=False) if merged_metadata else None,
             now,
             run_id,
         ),
@@ -5008,6 +5034,7 @@ def complete_task(
                 summary=summary if summary is not None else result,
                 metadata=metadata,
             )
+        launch = _worker_launch_for_run_locked(conn, run_id)
         # Carry the handoff summary in the event payload so gateway
         # notifiers and dashboard WS consumers can render it without a
         # second SQL round-trip. First line only, 400 char cap — the
@@ -5034,6 +5061,20 @@ def complete_task(
                 ]
                 if cleaned_artifacts:
                     completed_payload["artifacts"] = cleaned_artifacts
+        durable_evidence = bool(
+            (result or "").strip()
+            or (summary or "").strip()
+            or (isinstance(metadata, dict) and metadata)
+        )
+        if launch is not None:
+            completed_payload["worker_launch"] = launch.as_metadata()
+        if durable_evidence and launch is not None and launch.session_id:
+            cleanup_payload = {"session_id": launch.session_id}
+            if launch.cleanup_token:
+                cleanup_payload["cleanup_token"] = launch.cleanup_token
+            if launch.endpoint_id:
+                cleanup_payload["endpoint_id"] = launch.endpoint_id
+            completed_payload["visible_session_cleanup"] = cleanup_payload
         _append_event(
             conn, task_id, "completed",
             completed_payload,
@@ -5629,10 +5670,11 @@ def edit_completed_task_result(
                 "UPDATE task_runs SET summary = ? WHERE id = ?",
                 (handoff_summary, run_id),
             )
-            if metadata is not None:
+            merged_metadata = _merge_run_metadata_locked(conn, run_id, metadata)
+            if merged_metadata is not None:
                 conn.execute(
                     "UPDATE task_runs SET metadata = ? WHERE id = ?",
-                    (json.dumps(metadata, ensure_ascii=False), run_id),
+                    (json.dumps(merged_metadata, ensure_ascii=False), run_id),
                 )
         ev_summary = (
             handoff_summary.strip().splitlines()[0][:400]
@@ -8111,25 +8153,94 @@ def _record_spawn_failure(
     )
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
-    """Record the spawned child's pid + emit a ``spawned`` event.
-
-    The event's payload carries the pid so a human reading ``hermes kanban
-    tail`` can correlate log lines with OS-level traces without opening
-    the drawer.
-    """
-    with write_txn(conn):
-        conn.execute(
-            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-            (int(pid), task_id),
+def _normalize_worker_launch_record(
+    value: Any,
+) -> Optional[WorkerLaunchRecord]:
+    if value is None:
+        return None
+    if isinstance(value, WorkerLaunchRecord):
+        return value
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return WorkerLaunchRecord(pid=int(value))
+    if isinstance(value, Mapping):
+        pid_raw = value.get("pid")
+        pid = int(pid_raw) if isinstance(pid_raw, int) else None
+        session_id = str(value.get("session_id") or "").strip() or None
+        endpoint_id = str(value.get("endpoint_id") or "").strip() or None
+        display_label = str(value.get("display_label") or "").strip() or None
+        cleanup_token = str(value.get("cleanup_token") or "").strip() or None
+        return WorkerLaunchRecord(
+            pid=pid,
+            session_id=session_id,
+            endpoint_id=endpoint_id,
+            display_label=display_label,
+            cleanup_token=cleanup_token,
         )
+    raise TypeError(f"unsupported worker launch result: {type(value).__name__}")
+
+
+def _load_run_metadata_locked(conn: sqlite3.Connection, run_id: int) -> dict[str, Any]:
+    row = conn.execute("SELECT metadata FROM task_runs WHERE id = ?", (int(run_id),)).fetchone()
+    if row is None or not row["metadata"]:
+        return {}
+    try:
+        parsed = json.loads(row["metadata"])
+    except Exception:
+        return {}
+    return dict(parsed) if isinstance(parsed, dict) else {}
+
+
+def _worker_launch_for_run_locked(conn: sqlite3.Connection, run_id: Optional[int]) -> Optional[WorkerLaunchRecord]:
+    if run_id is None:
+        return None
+    metadata = _load_run_metadata_locked(conn, run_id)
+    return _normalize_worker_launch_record(metadata.get("worker_launch"))
+
+
+def _merge_run_metadata_locked(
+    conn: sqlite3.Connection,
+    run_id: int,
+    metadata: Optional[dict],
+) -> Optional[dict]:
+    merged = _load_run_metadata_locked(conn, run_id)
+    if isinstance(metadata, dict):
+        merged.update(metadata)
+    return merged or None
+
+
+def _record_worker_launch(conn: sqlite3.Connection, task_id: str, launch: WorkerLaunchRecord) -> None:
+    """Persist worker identity on the current run + emit the existing ``spawned`` event."""
+    with write_txn(conn):
+        if launch.pid is not None:
+            conn.execute(
+                "UPDATE tasks SET worker_pid = ? WHERE id = ?",
+                (int(launch.pid), task_id),
+            )
         run_id = _current_run_id(conn, task_id)
         if run_id is not None:
+            if launch.pid is not None:
+                conn.execute(
+                    "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
+                    (int(launch.pid), run_id),
+                )
+            metadata = _load_run_metadata_locked(conn, run_id)
+            metadata["worker_launch"] = launch.as_metadata()
             conn.execute(
-                "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
-                (int(pid), run_id),
+                "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                (json.dumps(metadata, ensure_ascii=False), run_id),
             )
-        _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        payload: dict[str, Any] = {}
+        if launch.pid is not None:
+            payload["pid"] = int(launch.pid)
+        payload["worker_launch"] = launch.as_metadata()
+        _append_event(conn, task_id, "spawned", payload, run_id=run_id)
+
+
+def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
+    """Legacy helper: normalize PID-only launch info into ``WorkerLaunchRecord``."""
+    _record_worker_launch(conn, task_id, WorkerLaunchRecord(pid=int(pid)))
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -8847,13 +8958,14 @@ def _dispatch_once_locked(
             try:
                 sig = inspect.signature(_spawn)
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
+                    launch_raw = _spawn(claimed, str(workspace), board=board)
                 else:
-                    pid = _spawn(claimed, str(workspace))
+                    launch_raw = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                launch_raw = _spawn(claimed, str(workspace))
+            launch = _normalize_worker_launch_record(launch_raw)
+            if launch is not None:
+                _record_worker_launch(conn, claimed.id, launch)
             # NOTE: we intentionally do NOT reset consecutive_failures
             # here. A successful spawn proves the worker can start but
             # doesn't prove the run will succeed. Under unified
@@ -8942,13 +9054,14 @@ def _dispatch_once_locked(
             try:
                 sig = inspect.signature(_spawn)
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
+                    launch_raw = _spawn(claimed, str(workspace), board=board)
                 else:
-                    pid = _spawn(claimed, str(workspace))
+                    launch_raw = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                launch_raw = _spawn(claimed, str(workspace))
+            launch = _normalize_worker_launch_record(launch_raw)
+            if launch is not None:
+                _record_worker_launch(conn, claimed.id, launch)
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
         except Exception as exc:
@@ -9226,6 +9339,36 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
 _retagged_workspace_roots: set[str] = set()
 
 
+def _normalize_visible_worker_label(head: Optional[str], tail: Optional[str]) -> Optional[str]:
+    prefix = str(head or "").strip()
+    suffix = re.sub(r"\s+", " ", str(tail or "").strip())
+    if prefix and suffix:
+        return f"{prefix} · {suffix[:72]}"
+    if prefix:
+        return prefix[:96]
+    return suffix[:96] if suffix else None
+
+
+def _worker_display_label(task: Task) -> Optional[str]:
+    head = None
+    title = task.title or ""
+    match = re.match(r"^([A-Za-z]+-\d+)\b", title.strip())
+    if match:
+        head = match.group(1)
+    elif task.current_run_id is not None:
+        head = f"run-{int(task.current_run_id)}"
+    else:
+        head = task.id.replace("t_", "")[:8]
+    return _normalize_visible_worker_label(head, title or task.body or task.id)
+
+
+def _worker_session_id(task: Task) -> Optional[str]:
+    if task.current_run_id is None:
+        return None
+    task_token = re.sub(r"[^A-Za-z0-9_-]+", "-", task.id).strip("-") or "task"
+    return f"kanban_{task_token}_run_{int(task.current_run_id)}"
+
+
 def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
     """Reclaim pre-tag worker rows in state.db so they leave the session lists.
 
@@ -9254,7 +9397,7 @@ def _default_spawn(
     workspace: str,
     *,
     board: Optional[str] = None,
-) -> Optional[int]:
+) -> Optional[WorkerLaunchRecord]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
     Returns the spawned child's PID so the dispatcher can detect crashes
@@ -9274,6 +9417,8 @@ def _default_spawn(
     from hermes_cli.profiles import normalize_profile_name
 
     profile_arg = normalize_profile_name(task.assignee)
+    worker_session_id = _worker_session_id(task)
+    display_label = _worker_display_label(task)
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
@@ -9314,6 +9459,8 @@ def _default_spawn(
     # sidebar renders one row per attempt, labeled with the worker's own prompt
     # ("work kanban task t_…").
     env["HERMES_SESSION_SOURCE"] = "kanban"
+    if worker_session_id:
+        env["HERMES_SESSION_ID"] = worker_session_id
     # Pin TERMINAL_CWD to the task's workspace so the worker's file tools and
     # context-file loader anchor on the workspace, not whatever cwd the
     # dispatching gateway happened to export. The worker subprocess is already
@@ -9461,7 +9608,11 @@ def _default_spawn(
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
-    return proc.pid
+    return WorkerLaunchRecord(
+        pid=int(proc.pid),
+        session_id=worker_session_id,
+        display_label=display_label,
+    )
 
 
 # ---------------------------------------------------------------------------

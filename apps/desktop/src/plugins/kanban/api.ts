@@ -11,6 +11,8 @@
 
 import { atom, type PluginRestOptions, type PluginStorage, queryClient } from '@hermes/plugin-sdk'
 
+import { closeSessionTile, openSessionTile, patchSessionTile } from '@/store/session-states'
+
 import type {
   BoardMeta,
   BoardsResponse,
@@ -27,7 +29,106 @@ import type {
 type Rest = <T>(path: string, opts?: PluginRestOptions) => Promise<T>
 type Socket = (path: string, onMessage: (data: unknown) => void) => () => void
 
+type KanbanTaskEvent = {
+  kind?: string
+  payload?: unknown
+  task_id?: string
+}
+
+type WorkerLaunchPayload = {
+  cleanup_token?: string
+  display_label?: string
+  endpoint_id?: string
+  pid?: number
+  session_id?: string
+}
+
 let rest: null | Rest = null
+
+function normalizeVisibleSessionLabel(value: unknown): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined
+  }
+
+  const singleLine = value
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  return singleLine ? singleLine.slice(0, 96) : undefined
+}
+
+function readWorkerLaunch(payload: unknown): WorkerLaunchPayload | null {
+  if (!payload || typeof payload !== 'object') {
+    return null
+  }
+
+  const nested = (payload as { worker_launch?: unknown }).worker_launch
+
+  if (!nested || typeof nested !== 'object') {
+    return null
+  }
+
+  const launch = nested as Record<string, unknown>
+  const sessionId = typeof launch.session_id === 'string' ? launch.session_id.trim() : ''
+
+  if (!sessionId) {
+    return null
+  }
+
+  return {
+    cleanup_token: typeof launch.cleanup_token === 'string' ? launch.cleanup_token : undefined,
+    display_label: normalizeVisibleSessionLabel(launch.display_label),
+    endpoint_id: typeof launch.endpoint_id === 'string' ? launch.endpoint_id : undefined,
+    pid: typeof launch.pid === 'number' ? launch.pid : undefined,
+    session_id: sessionId,
+  }
+}
+
+function readVisibleSessionCleanup(payload: unknown): null | { session_id: string } {
+  if (!payload || typeof payload !== 'object') {
+    return null
+  }
+
+  const cleanup = (payload as { visible_session_cleanup?: unknown }).visible_session_cleanup
+
+  if (!cleanup || typeof cleanup !== 'object') {
+    return null
+  }
+
+  const sessionId = typeof (cleanup as { session_id?: unknown }).session_id === 'string'
+    ? ((cleanup as { session_id?: string }).session_id ?? '').trim()
+    : ''
+
+  return sessionId ? { session_id: sessionId } : null
+}
+
+export function applyVisibleSessionEventEffects(events: readonly KanbanTaskEvent[]): void {
+  for (const event of events) {
+    if (event.kind === 'spawned') {
+      const launch = readWorkerLaunch(event.payload)
+
+      if (!launch?.session_id) {
+        continue
+      }
+
+      openSessionTile(launch.session_id, 'center')
+
+      if (launch.display_label) {
+        patchSessionTile(launch.session_id, { titleOverride: launch.display_label })
+      }
+
+      continue
+    }
+
+    if (event.kind === 'completed') {
+      const cleanup = readVisibleSessionCleanup(event.payload)
+
+      if (cleanup?.session_id) {
+        closeSessionTile(cleanup.session_id)
+      }
+    }
+  }
+}
 
 /** Selected board slug ('' = the server's current board). Persisted. */
 export const $boardSlug = atom<string>('')
@@ -52,11 +153,13 @@ const COLLAPSED_KEY = 'collapsedLanes'
  *  each touched task's detail. The polls (8s board / 4s drawer) stay as the
  *  fallback — the socket just makes the board feel instant. */
 function onEventsFrame(slug: string, data: unknown): void {
-  const events = (data as { events?: Array<{ task_id?: string }> })?.events
+  const events = (data as { events?: KanbanTaskEvent[] })?.events
 
   if (!events?.length) {
     return
   }
+
+  applyVisibleSessionEventEffects(events)
 
   void queryClient.invalidateQueries({ queryKey: ['kanban', 'board'] })
   // Any event can change a board's card count — keep the switcher badge honest.

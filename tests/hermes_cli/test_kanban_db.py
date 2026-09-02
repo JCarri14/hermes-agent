@@ -604,6 +604,97 @@ def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     ]
 
 
+def test_dispatch_once_persists_structured_worker_launch_record(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="ERP-287 implement retry", assignee="default")
+
+        def _spawn(task, workspace, board=None):
+            assert task.id == task_id
+            return kb.WorkerLaunchRecord(
+                pid=4321,
+                session_id="kanban_t_dispatch_run_1",
+                endpoint_id="copilot-session-1",
+                display_label="ERP-287 · implement retry",
+                cleanup_token="cleanup-1",
+            )
+
+        res = kb.dispatch_once(conn, spawn_fn=_spawn, max_spawn=1)
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert res.spawned == [(task_id, "default", task.workspace_path)]
+
+        run = kb.latest_run(conn, task_id)
+        assert run is not None
+        assert run.worker_pid == 4321
+        assert run.metadata is not None
+        assert run.metadata["worker_launch"] == {
+            "pid": 4321,
+            "session_id": "kanban_t_dispatch_run_1",
+            "endpoint_id": "copilot-session-1",
+            "display_label": "ERP-287 · implement retry",
+            "cleanup_token": "cleanup-1",
+        }
+        spawned = [e for e in kb.list_events(conn, task_id) if e.kind == "spawned"][-1]
+        assert spawned.payload is not None
+        assert spawned.payload["worker_launch"]["session_id"] == "kanban_t_dispatch_run_1"
+        assert spawned.payload["pid"] == 4321
+
+
+def test_dispatch_once_keeps_legacy_pid_only_spawn_compatible(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="legacy spawn", assignee="default")
+        res = kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: 2468, max_spawn=1)
+        assert len(res.spawned) == 1
+
+        run = kb.latest_run(conn, task_id)
+        assert run is not None
+        assert run.worker_pid == 2468
+        assert run.metadata is not None
+        assert run.metadata["worker_launch"] == {"pid": 2468}
+
+
+def test_complete_task_emits_exact_cleanup_only_when_session_identity_is_persisted(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="cleanup exact", assignee="default")
+        kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace, board=None: kb.WorkerLaunchRecord(
+                pid=2222,
+                session_id="kanban_t_cleanup_run_1",
+                endpoint_id="copilot-session-2",
+                cleanup_token="cleanup-2",
+            ),
+            max_spawn=1,
+        )
+
+        assert kb.complete_task(conn, task_id, result="done", summary="collected evidence")
+
+        completed = [e for e in kb.list_events(conn, task_id) if e.kind == "completed"][-1]
+        assert completed.payload is not None
+        assert completed.payload["visible_session_cleanup"] == {
+            "session_id": "kanban_t_cleanup_run_1",
+            "endpoint_id": "copilot-session-2",
+            "cleanup_token": "cleanup-2",
+        }
+        run = kb.latest_run(conn, task_id)
+        assert run is not None
+        assert run.metadata is not None
+        assert run.metadata["worker_launch"]["session_id"] == "kanban_t_cleanup_run_1"
+
+
+def test_complete_task_with_missing_session_identity_does_not_emit_visible_cleanup(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="cleanup missing", assignee="default")
+        kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: 3333, max_spawn=1)
+
+        assert kb.complete_task(conn, task_id, result="done")
+
+        completed = [e for e in kb.list_events(conn, task_id) if e.kind == "completed"][-1]
+        assert completed.payload is not None
+        assert "visible_session_cleanup" not in completed.payload
+        assert completed.payload["worker_launch"] == {"pid": 3333}
+
+
 
 
 # ---------------------------------------------------------------------------

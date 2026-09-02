@@ -78,6 +78,7 @@ import type { RpcEvent } from '@/types/hermes'
 
 import type { ClientSessionState } from '../../../types'
 import { finalizeInterruptedMessages } from '../use-prompt-actions/rewind'
+import { applyVisibleSubagentEvent } from './visible-subagent-sessions'
 
 import { hasSessionInfoStatePatch, sessionInfoStatePatch, SUBAGENT_EVENT_TYPES, toTodoPayload } from './utils'
 
@@ -904,6 +905,8 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           if (!nativeSubagentSessionsRef.current.has(sessionId)) {
             pruneDelegateFallbackSubagents(sessionId)
           }
+
+          applyVisibleSubagentEvent(event.type, payload as Record<string, unknown>)
 
           nativeSubagentSessionsRef.current.add(sessionId)
           upsertSubagent(
