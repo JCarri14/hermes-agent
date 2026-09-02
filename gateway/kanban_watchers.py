@@ -1160,6 +1160,19 @@ class GatewayKanbanWatchersMixin:
                         max_in_progress_per_profile,
                     )
 
+        # Optional conflict-prediction admission gate (default OFF). When on, a
+        # ready Developer card that would conflict with an already-running
+        # same-base Developer is deferred (stays ready) instead of spawned.
+        conflict_gate = bool(kanban_cfg.get("conflict_gate", False))
+        if conflict_gate:
+            logger.info("kanban dispatcher: conflict_gate=on")
+        # Optional pre-action destructive gate (default OFF). When on, a ready
+        # card whose title/body signals a destructive/irreversible action on a
+        # LIVE resource is not spawned until a human GO comment is recorded.
+        destructive_gate = bool(kanban_cfg.get("destructive_gate", False))
+        if destructive_gate:
+            logger.info("kanban dispatcher: destructive_gate=on")
+
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
@@ -1254,6 +1267,8 @@ class GatewayKanbanWatchersMixin:
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     reconcile_orphans=reconcile_orphans,
+                    conflict_gate=conflict_gate,
+                    destructive_gate=destructive_gate,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):

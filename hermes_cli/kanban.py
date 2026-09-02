@@ -2460,6 +2460,15 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             _kanban_cfg.get("max_in_progress_per_profile")
         )
         max_in_progress = _coerce_positive_int(_kanban_cfg.get("max_in_progress"))
+        # Optional conflict-prediction admission gate (default OFF). When on, a
+        # ready Developer card that would conflict with an already-running
+        # same-base Developer is deferred (stays ready) instead of spawned.
+        conflict_gate = bool(_kanban_cfg.get("conflict_gate", False))
+        # Optional pre-action destructive gate (kanban.destructive_gate). When
+        # on, a ready card whose title/body signals a destructive/irreversible
+        # action on a LIVE resource is NOT spawned until a human GO comment is
+        # recorded (pre-verification -> human GO -> destructive action).
+        destructive_gate = bool(_kanban_cfg.get("destructive_gate", False))
         # CLI --max overrides config kanban.max_spawn when both are present;
         # CLI is the more explicit signal so it wins.
         cli_max = getattr(args, "max", None)
@@ -2471,6 +2480,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_in_progress_per_profile = None
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
+        conflict_gate = False
+        destructive_gate = False
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn,
@@ -2480,6 +2491,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            conflict_gate=conflict_gate,
+            destructive_gate=destructive_gate,
         )
     if getattr(args, "json", False):
         print(json.dumps({

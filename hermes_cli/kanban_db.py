@@ -2968,6 +2968,39 @@ def create_task(
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
 
+    # FAIL-CLOSED (F1b) project/board validation.
+    # If any project context is requested, the board must exist (E) and must
+    # not conflict with the requested project (D). We never fall back to
+    # scratch/default/current/cwd on invalid or inconsistent project context.
+    _resolve_board_slug = board or get_current_board()
+    _need_project_check = project_id is not None
+
+    # A board is "real" only when it has persisted metadata (board.json) — a
+    # weed board DB materialized by a bare ``connect`` is NOT a registered
+    # board (F1b case E: never create/accept a board implicitly). ``default``
+    # is the legacy board and always counted as existing.
+    def _board_registered(slug: str) -> bool:
+        if slug == DEFAULT_BOARD:
+            return True
+        return board_metadata_path(slug).exists()
+
+    if _need_project_check:
+        if not _board_registered(_resolve_board_slug):
+            raise ValueError(
+                f"board '{_resolve_board_slug}' does not exist; "
+                f"cannot create task with project context '{project_id}'"
+            )
+        try:
+            _bmeta = read_board_metadata(_resolve_board_slug)
+            _board_project = (_bmeta.get("project_id") or "").strip()
+        except Exception:
+            _board_project = ""
+        if _board_project and project_id and _board_project != project_id:
+            raise ValueError(
+                f"board '{_resolve_board_slug}' is project-bound to "
+                f"'{_board_project}' but task project is '{project_id}'"
+            )
+
     # Inherit the board's scoped project when the caller didn't name one, so a
     # project-scoped board anchors every new task to that project's repo
     # (deterministic worktree + branch) without each surface repeating it.
@@ -3050,10 +3083,15 @@ def create_task(
                             workspace_kind = "worktree"
 
         if project_obj is None:
-            # A project id/slug that doesn't resolve must not crash task
-            # creation or persist a dangling reference — drop the link and
-            # create the task as an ordinary (scratch) task.
-            project_id = None
+            # FAIL-CLOSED (F1b): if a project id/slug was requested but neither
+            # the registry nor the cross-profile source-task fallback resolved
+            # it, refuse to create the task. Never silently degrade to scratch/
+            # default/current/cwd. (The source-task fallback above already
+            # populated project_obj when it succeeded.)
+            raise ValueError(
+                f"project '{project_id}' does not exist in the projects "
+                f"registry; refusing to create task"
+            )
         else:
             # Canonicalise (a slug may have been passed) and anchor the
             # worktree under the project's primary repo.
@@ -6824,6 +6862,19 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    skipped_conflict_serialized: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, class)`` ready Developer tasks deferred this tick by the
+    optional conflict gate (``kanban.conflict_gate``). The card stays
+    ``ready`` and is re-evaluated on a later tick after the active same-base
+    Developer merges and branches refresh. This is a deterministic, read-only
+    admission signal, NOT an operator-actionable failure."""
+    skipped_destructive_gate: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, class)`` ready tasks deferred this tick by the optional
+    pre-action destructive gate (``kanban.destructive_gate``). The card signals
+    a destructive/irreversible action on a live resource and has NO recorded
+    human GO, so it stays ``ready`` (never claimed / spawned) until a human
+    records the canonical GO comment. This is the pre-action gate: the
+    destructive action cannot start without prior human consent."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -8295,6 +8346,95 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+def _conflict_gate_should_serialize(conn, task_id, assignee, *, board=None):
+    """Return ``(class, reason)`` to defer a ready Developer card, or ``None``
+    to allow it. Deterministic + read-only; called only when ``conflict_gate``
+    is enabled. Heavy logic lives in ``hermes_cli.conflict_gate``.
+
+    ``None`` means: allow (either no running same-base Developer, or the gate
+    classified PARALLEL_SAFE). A tuple means SERIALIZE/UNKNOWN -> the caller
+    leaves the card ``ready`` (no claim/spawn) and re-evaluates next tick.
+    """
+    try:
+        from hermes_cli.conflict_gate import (
+            GateInput,
+            evaluate,
+            UNKNOWN,
+            _resolve_gate_repo_root,
+            _parse_target_paths_manifest,
+        )
+    except Exception as exc:
+        return (UNKNOWN, f"conflict_gate unavailable: {exc}")
+    try:
+        cand = conn.execute(
+            "SELECT id, project_id, branch_name, workspace_path FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+    except Exception as exc:
+        return (UNKNOWN, f"gate candidate lookup failed: {exc}")
+    if cand is None or cand["branch_name"] is None:
+        return (UNKNOWN, "gate candidate has no branch")
+    try:
+        running = conn.execute(
+            "SELECT id, project_id, branch_name FROM tasks "
+            "WHERE status='running' AND id != ?",
+            (task_id,),
+        ).fetchall()
+    except Exception as exc:
+        return (UNKNOWN, f"gate running lookup failed: {exc}")
+    # Same base == same project_id (cards in the same repo/worktree base).
+    same_base = [r for r in running if cand["project_id"] and r["project_id"] == cand["project_id"]]
+    active_branches = [r["branch_name"] for r in same_base if r["branch_name"]]
+    if not active_branches:
+        return None  # no active same-base Developer -> allow (first slot)
+    repo_root = _resolve_gate_repo_root(conn, task_id, cand, board=board)
+    if not repo_root:
+        return (UNKNOWN, "gate repo_root unavailable")
+    manifest = _parse_target_paths_manifest(conn, task_id)
+    try:
+        v = evaluate(GateInput(
+            repo_root=repo_root,
+            base_ref="origin/dev",
+            active_branches=active_branches,
+            candidate_branch=cand["branch_name"],
+            candidate_manifest_paths=manifest,
+        ))
+    except Exception as exc:
+        # Fail-safe: the gate must never crash the dispatch tick. Any unexpected
+        # error degrades to UNKNOWN -> SERIALIZE (defer, card stays ready).
+        return (UNKNOWN, f"gate evaluate error: {exc}")
+    if v.cls in (UNKNOWN, "SERIALIZE"):
+        return (v.cls, "; ".join(v.reasons))
+    return None  # PARALLEL_SAFE -> allow
+
+
+def _destructive_gate_requires_go(conn, task_id, *, board=None):
+    """Return ``(cls, reason)`` to block a ready destructive-live card, or
+    ``None`` to allow it. Deterministic + read-only; called only when
+    ``kanban.destructive_gate`` is enabled. Heavy logic lives in
+    ``hermes_cli.destructive_gate``.
+
+    ``None`` means: allow (card is not destructive-live, or a human GO comment
+    is already recorded). A tuple means DESTRUCTIVE_LIVE -> the caller leaves
+    the card ``ready`` (no claim/spawn) and re-evaluates next tick until a
+    human records the canonical GO comment. This is the pre-action gate: the
+    destructive action is blocked from starting before human consent.
+    """
+    try:
+        from hermes_cli.destructive_gate import (
+            destructive_gate_requires_go as _dg_eval,
+        )
+    except Exception as exc:
+        return ("DESTRUCTIVE_LIVE", f"destructive_gate unavailable: {exc}")
+    try:
+        return _dg_eval(conn, task_id, board=board)
+    except Exception as exc:
+        # Fail-safe: the gate must never crash the dispatch tick. Any unexpected
+        # error blocks (require human GO), never lets a possibly-destructive
+        # live action through.
+        return ("DESTRUCTIVE_LIVE", f"destructive_gate evaluate error: {exc}")
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -8309,6 +8449,8 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    conflict_gate: bool = False,
+    destructive_gate: bool = False,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -8344,6 +8486,8 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            conflict_gate=conflict_gate,
+            destructive_gate=destructive_gate,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -8361,6 +8505,8 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            conflict_gate=conflict_gate,
+            destructive_gate=destructive_gate,
         )
         # Still under the dispatch lock: opportunistically truncate the WAL
         # at a coarse interval so it cannot grow unbounded between restarts.
@@ -8382,6 +8528,8 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    conflict_gate: bool = False,
+    destructive_gate: bool = False,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -8598,6 +8746,43 @@ def _dispatch_once_locked(
                 result.skipped_per_profile_capped.append(
                     (row["id"], row_assignee, current)
                 )
+                continue
+        # Optional conflict gate: deterministic, read-only admission check that
+        # runs ONLY when the candidate would occupy an additional Developer slot
+        # on a base that already has a running Developer. Off by default
+        # (kanban.conflict_gate). When it denies (SERIALIZE/UNKNOWN) the card
+        # is left `ready` (no claim, no spawn) and re-evaluated next tick.
+        if conflict_gate:
+            _cg = _conflict_gate_should_serialize(conn, row["id"], row_assignee, board=board)
+            if _cg is not None:
+                cls_, reason = _cg
+                result.skipped_conflict_serialized.append((row["id"], cls_))
+                if not dry_run:
+                    with write_txn(conn):
+                        _append_event(
+                            conn, row["id"], "conflict_serialized",
+                            {"class": cls_, "reason": reason},
+                        )
+                continue
+        # Pre-action destructive gate: deterministic, read-only admission
+        # check. When enabled (kanban.destructive_gate), a ready card whose
+        # title/body signals a destructive/irreversible action on a LIVE
+        # resource is NOT claimed/spawned until a human GO has been recorded
+        # on the card (canonical comment `@go destructive <task_id>` by a
+        # non-executor author). The card stays `ready` and is re-evaluated
+        # next tick. This enforces the policy ordering:
+        #   pre-verification -> human GO -> destructive action -> postcondition.
+        if destructive_gate:
+            _rg = _destructive_gate_requires_go(conn, row["id"], board=board)
+            if _rg is not None:
+                cls_, reason = _rg
+                result.skipped_destructive_gate.append((row["id"], cls_))
+                if not dry_run:
+                    with write_txn(conn):
+                        _append_event(
+                            conn, row["id"], "destructive_gate_held",
+                            {"class": cls_, "reason": reason},
+                        )
                 continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
