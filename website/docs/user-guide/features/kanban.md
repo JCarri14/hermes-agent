@@ -246,6 +246,96 @@ Malformed entries are ignored, so they cannot widen access. Boards not listed
 remain backward compatible: `kanban.destructive_gate: true` is still the
 explicit global opt-in for the existing live-resource classifier.
 
+### Historical process precedent: JCS-160
+
+JCS-160 is a **closed historical process deviation**, not an active migration
+step. A cleanup of an empty live object-store bucket was materially correct:
+the delete returned `200` and its postcondition read returned `404`. However,
+the human GO was recorded only afterward, when approving card closure. The
+ex-post closure approval did not retroactively authorize the destructive
+operation.
+
+The result must **not** be reopened or reverted: the resource was empty and no
+data loss was reported. Preserve this case only as a process-hardening
+precedent, separate from the active migration. For every future live,
+destructive action the required order is:
+
+```text
+pre-verification -> human GO -> destructive action -> postcondition verification
+```
+
+A human approval to close a card after an action is not a substitute for the
+prior GO required by the dispatcher gate.
+
+### Deterministic human-GO (v1.1)
+
+On boards with the gate active, the human GO is **bound to a concrete
+action**, not just to the card. The card declares its live action with
+canonical body lines (read by the gate):
+
+```text
+destructive_action_id: sha256:<hex16>
+destructive_verb: delete
+destructive_resource: r2://erp-client-a-docs
+destructive_tenant: CLIENT_A
+```
+
+When the card does not declare `destructive_action_id`, the gate derives a
+deterministic digest over `tenant|verb|resource|executor` (the executor is
+the card's assignee, so a GO is not portable between workers). The operator
+records the canonical sequence as `task_events` rows — the **event is the
+source of truth**; the comment is the human-readable artifact:
+
+```text
+pre-verification -> human GO -> destructive action -> postcondition verification
+
+hermes kanban preverify-destructive <task_id> [<action_id>]        # [P]
+hermes kanban approve-destructive <task_id> [<action_id>]          # [H] human GO
+... worker executes the destructive action after the claim admits ...
+hermes kanban approve-destructive <task_id> [<action_id>] \
+  --postcondition --evidence "read returned HTTP 404"              # [Q]
+```
+
+Enforcement is fail-closed and centralized:
+
+* **`claim_task`** refuses to start a destructive-live card unless, for the
+  card's current `destructive_action_id`: a `destructive_preverified` event
+  exists first (when `kanban.destructive_require_preverify` is true or the
+  board is in `productive_boards`), and a canonical `destructive_authorized`
+  event exists that matches the action and is not stale. A GO recorded after
+  the action, a GO for a different action_id, or a stale GO (TTL exceeded or
+  card edited after the GO) all block the claim; the card stays `ready` with
+  a `destructive_gate_held` event and actionable guidance.
+* **`complete_task`** refuses to close a destructive-live card without the
+  canonical GO **and** a `destructive_postcondition_posted` event recorded
+  after it. The closing run's metadata carries `approved_action_id` /
+  `authorized_event_id` / `postverified_event_id` for traceability.
+
+Author anti-spoofing: the `destructive_authorized` event is only created when
+the GO comment's author is **not** the card's assignee and **not** a
+denylisted identity (`kanban.destructive_go_denylist_authors`: dashboard,
+worker, hermes-system, system, specifier, decomposer, auto-decomposer). A
+worker or the dashboard can never self-GO; a GO recorded by direct SQL or the
+dashboard POST produces no event and is therefore ignored on gated boards.
+
+New config keys (defaults preserve existing behaviour; `destructive_gate`
+stays OFF by default):
+
+```yaml
+kanban:
+  destructive_tenants: []                       # tenant-scoped live boards
+  destructive_authorized_ttl_seconds: 604800    # GO staleness (7 days)
+  destructive_require_preverify: false          # true on productive_boards
+  destructive_go_denylist_authors: [dashboard, worker, hermes-system, ...]
+```
+
+Outside `productive_boards`, with `destructive_require_preverify: false`
+(the default), the legacy `@go destructive <task_id>` comment flow keeps
+working for cards that do not declare an action binding — only boards that
+opt in get the stricter deterministic mechanism. See the plan
+`.hermes/plans/2026-09-02_101500-pre-action-destructive-gate-policy-v1.1.md`
+for the full policy.
+
 Override the config flag at runtime via `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0`
 for debugging. Standard gateway supervision applies: run `hermes gateway
 start` directly, or wire the gateway up as a systemd user unit (see the

@@ -329,6 +329,26 @@ kanban:
   productive_boards: []
   destructive_gate: false
   destructive_allowlist: []
+  # Deterministic human-GO mechanism (v1.1). Cards whose tenant is listed
+  # here are in scope for the pre-action gate even when the classifier does
+  # not fire on their title/body.
+  destructive_tenants: []
+  # Staleness window (seconds) for a canonical destructive_authorized event.
+  destructive_authorized_ttl_seconds: 604800
+  # When true (or on any productive_boards board), claims additionally
+  # require a destructive_preverified event BEFORE the human GO. False
+  # outside productive boards preserves the legacy @go destructive comment
+  # flow.
+  destructive_require_preverify: false
+  # Authors that can never record the human GO / pre-verification.
+  destructive_go_denylist_authors:
+    - dashboard
+    - worker
+    - hermes-system
+    - system
+    - specifier
+    - decomposer
+    - auto-decomposer
 
 # =============================================================================
 # Terminal Tool Configuration

@@ -168,3 +168,76 @@ def test_evaluate_destructive_self_go_excluded():
     inp = GateInput("t1", "Drop table", "Drop the live orders table.", [])
     v = evaluate(inp)
     assert v.cls == DESTRUCTIVE_LIVE
+
+
+# ────────────────────────── v1.1 vocabulary extensions ─────────────────────────
+
+
+def test_classify_truncate_live():
+    v = _classify("Truncate live orders table", "Truncate the live orders table in postgres.")
+    assert v.cls == DESTRUCTIVE_LIVE
+    assert "destructive verb + live-resource marker" in "; ".join(v.reasons)
+
+
+def test_classify_revoke_credential_live():
+    v = _classify("Revoke credential", "Revoke the live API key for the ERP tenant.")
+    assert v.cls == DESTRUCTIVE_LIVE
+
+
+def test_classify_replace_secret_live():
+    v = _classify("Rename user", "Replace the production secret for CLIENT_A.")
+    assert v.cls == DESTRUCTIVE_LIVE
+
+
+# ────────────────────────── v1.1 GO matcher (action_id) ───────────────────────
+
+
+def test_go_matcher_with_action_id():
+    # v1.1 canonical form with a bound action_id.
+    assert _is_human_go("@go destructive t_x sha256:ab12", "t_x")
+    assert _is_human_go("go destructive t_x sha256:ab12", "t_x")
+    assert _is_human_go("GO_DESTRUCTIVE t_x sha256:ab12", "t_x")
+    assert _is_human_go("approval:\n@go destructive t_x sha256:ab12\nok", "t_x")
+    # Legacy form without action_id still matches (backward compat).
+    assert _is_human_go("@go destructive t_x", "t_x")
+    # No id at all -> not a GO line.
+    assert not _is_human_go("@go destructive", "t_x")
+
+
+def test_action_id_from_go_line_extracts_bound_action():
+    from hermes_cli.destructive_gate import action_id_from_go_line
+
+    assert action_id_from_go_line("@go destructive t_x sha256:ab12") == "sha256:ab12"
+    assert action_id_from_go_line("@go destructive t_x") is None
+    assert action_id_from_go_line("not a go") is None
+
+
+# ─────────────────────── deterministic action_id digest ───────────────────────
+
+
+def test_digest_deterministic():
+    from hermes_cli.destructive_gate import compute_destructive_action_id
+
+    t = "Truncate live orders table"
+    b = "Truncate the live orders table in postgres."
+    a1 = compute_destructive_action_id(t, b, tenant="CLIENT_A", assignee="dev")
+    a2 = compute_destructive_action_id(t, b, tenant="CLIENT_A", assignee="dev")
+    assert a1 == a2  # same input -> same digest
+    assert a1.startswith("sha256:")
+    assert len(a1) == len("sha256:") + 16
+    # Different tenant -> different digest.
+    b_other = compute_destructive_action_id(t, b, tenant="CLIENT_B", assignee="dev")
+    assert a1 != b_other
+    # Different executor -> different digest (GO not portable between workers).
+    c_other = compute_destructive_action_id(t, b, tenant="CLIENT_A", assignee="other")
+    assert a1 != c_other
+
+
+def test_declared_action_id_wins_over_derived_digest():
+    from hermes_cli.destructive_gate import compute_destructive_action_id
+
+    body = "destructive_action_id: sha256:declaredabc\n" \
+           "destructive_verb: delete\ndestructive_resource: r2://x\n" \
+           "destructive_tenant: CLIENT_A"
+    assert compute_destructive_action_id("Cleanup", body, tenant="WHATEVER", assignee="dev") \
+        == "sha256:declaredabc"

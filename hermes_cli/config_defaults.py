@@ -2773,6 +2773,31 @@ DEFAULT_CONFIG = {
         "productive_boards": [],
         "destructive_gate": False,
         "destructive_allowlist": [],
+        # v1.1 deterministic human-GO mechanism (see
+        # hermes_cli/destructive_gate.py). Cards whose `tenant` is listed here
+        # are in scope for the pre-action gate even when the classifier does
+        # not fire on their title/body.
+        "destructive_tenants": [],
+        # Staleness window for a canonical `destructive_authorized` event
+        # (human GO). A GO older than this no longer admits claim/completion.
+        "destructive_authorized_ttl_seconds": 604800,
+        # When true (or on any `productive_boards` board), claims of
+        # destructive-live cards additionally require a
+        # `destructive_preverified` event recorded BEFORE the GO. Default
+        # false outside productive boards preserves the legacy GO-comment
+        # flow for existing opt-in boards.
+        "destructive_require_preverify": False,
+        # Authors that can never record the human GO / pre-verification
+        # (executor-adjacent and system surfaces).
+        "destructive_go_denylist_authors": [
+            "dashboard",
+            "worker",
+            "hermes-system",
+            "system",
+            "specifier",
+            "decomposer",
+            "auto-decomposer",
+        ],
         # Automatically claim tasks in the first-class review column and spawn
         # the assigned profile with the bundled sdlc-review skill. Disable for
         # boards where every review is performed manually from the dashboard.
