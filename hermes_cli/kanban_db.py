@@ -8383,6 +8383,18 @@ _RESPAWN_BLOCKER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Prefix ``dispatch_once`` stamps on spawn failures raised while resolving
+# the task's workspace (dispatch_once → ``_record_spawn_failure`` with
+# ``f"workspace: {exc}"``). These are LOCAL environment problems — typo'd
+# path, filesystem permissions, missing dir, corrupt worktree — never
+# quota/auth blockers: once an operator fixes the path, the next tick must
+# spawn again. ``check_respawn_guard`` skips the auth regex for this prefix
+# so a filesystem "Permission denied" can't masquerade as ``blocker_auth``
+# and strand the task in ``ready`` forever, even after the real error is
+# gone (incident t_ce9cfba7). Write sites and guard share this constant so
+# the contract can't drift.
+_SPAWN_WORKSPACE_ERROR_PREFIX = "workspace: "
+
 # Within this window a completed run counts as "recent proof"; don't re-spawn.
 _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 
@@ -9964,8 +9976,21 @@ def check_respawn_guard(
         return None
 
     # 2. Quota / auth blocker: retrying immediately will not help.
+    #    Only failures reported from the worker's own execution qualify.
+    #    Spawn-phase failures raised while resolving the task workspace
+    #    carry the ``_SPAWN_WORKSPACE_ERROR_PREFIX`` (see dispatch_once) and
+    #    are local-environment issues: a typo'd path, filesystem permissions,
+    #    a missing dir or a corrupt worktree. They must never read as auth
+    #    blockers — an operator fixing the path needs the very next tick to
+    #    re-spawn, and a filesystem "permission denied" (e.g. '/hoame' typo
+    #    in workspace_path) is not a quota wall, so it must not strand the
+    #    task in ``ready`` forever (incident t_ce9cfba7).
     err = row["last_failure_error"]
-    if err and _RESPAWN_BLOCKER_RE.search(err):
+    if (
+        err
+        and not err.startswith(_SPAWN_WORKSPACE_ERROR_PREFIX)
+        and _RESPAWN_BLOCKER_RE.search(err)
+    ):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR
@@ -10778,7 +10803,7 @@ def _dispatch_once_locked(
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
             auto = _record_spawn_failure(
-                conn, claimed.id, f"workspace: {exc}",
+                conn, claimed.id, _SPAWN_WORKSPACE_ERROR_PREFIX + str(exc),
                 failure_limit=failure_limit,
             )
             if auto:
@@ -10905,7 +10930,7 @@ def _dispatch_once_locked(
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
             auto = _record_spawn_failure(
-                conn, claimed.id, f"workspace: {exc}",
+                conn, claimed.id, _SPAWN_WORKSPACE_ERROR_PREFIX + str(exc),
                 failure_limit=failure_limit,
             )
             if auto:
