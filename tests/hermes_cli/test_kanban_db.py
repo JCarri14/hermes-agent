@@ -367,10 +367,107 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         assert kb.check_respawn_guard(conn, tid) is None
 
 
+def test_check_respawn_guard_ignores_workspace_resolution_failure(kanban_home):
+    """A spawn failure from workspace resolution must NOT trip ``blocker_auth``.
+
+    Regression for incident t_ce9cfba7: a typo'd ``workspace_path`` wrote
+    ``workspace: [Errno 13] Permission denied: '/hoame'`` into
+    ``last_failure_error``, and the guard's auth regex read the filesystem
+    "permission denied" as an auth blocker — stranding the task in ``ready``
+    forever even after the operator fixed the path. Errors carrying the
+    ``workspace: `` spawn-phase prefix are local-env issues (bad path, fs
+    permissions, corrupt worktree), never quota/auth walls: the guard must
+    return None so the very next tick re-spawns.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ws-guard", assignee="a")
+        # Record exactly the incident's error through the real spawn-failure
+        # path (outcome='spawn_failed', task back to ready).
+        kb.claim_task(conn, tid)
+        auto = kb._record_spawn_failure(
+            conn, tid,
+            "workspace: [Errno 13] Permission denied: '/hoame'",
+        )
+        assert auto is False
+        assert kb.get_task(conn, tid).status == "ready"
+        # The guard must not classify the workspace failure as an auth blocker.
+        assert kb.check_respawn_guard(conn, tid) is None
 
 
+def test_check_respawn_guard_still_blocks_run_phase_auth_error(kanban_home):
+    """Real worker-run auth/quota failures must keep tripping ``blocker_auth``.
+
+    The workspace-prefix exemption applies ONLY to spawn-phase workspace
+    resolution; a failure reported from inside the worker run (401 /
+    unauthorized / quota) carries no prefix and must stay guarded. The
+    prefix is the discriminator: even auth-flavored text stamped under
+    ``workspace: `` (e.g. a git https fetch failing 401 while materializing
+    a worktree) is a local resolution problem, not a provider auth wall.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="auth-guard", assignee="a")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error=? WHERE id=?",
+            ("worker exited: 401 unauthorized (invalid api key)", tid),
+        )
+        conn.commit()
+        assert kb.check_respawn_guard(conn, tid) == "blocker_auth"
+
+        conn.execute(
+            "UPDATE tasks SET last_failure_error=? WHERE id=?",
+            ("workspace: 401 unauthorized while fetching worktree", tid),
+        )
+        conn.commit()
+        assert kb.check_respawn_guard(conn, tid) is None
 
 
+def test_dispatch_once_respawns_after_workspace_path_fixed(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    """Fixing a bad ``workspace_path`` must let the next tick spawn.
+
+    Regression for incident t_ce9cfba7: once a workspace resolution failed
+    (spawn_failed), the guard kept returning ``blocker_auth`` on the stamped
+    ``workspace: ...`` error and the card stayed stranded in ``ready`` even
+    after the path was corrected in the DB. After the fix the guard ignores
+    spawn-phase workspace failures, so a corrected path spawns on the next
+    dispatch tick with no manual ``last_failure_error`` cleanup.
+    """
+    # A path whose parent is a regular file: mkdir reliably raises.
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x", encoding="utf-8")
+    bad_path = blocker / "sub" / "ws"
+    good_path = tmp_path / "fixed-ws"
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="ws-recover", assignee="alice",
+            workspace_kind="dir", workspace_path=str(bad_path),
+        )
+
+        # First tick: workspace resolution fails -> spawn_failed, task ready.
+        res = kb.dispatch_once(
+            conn, spawn_fn=lambda task, workspace, board=None: 4242,
+            max_spawn=1,
+        )
+        assert res.spawned == []
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.last_failure_error is not None
+        assert task.last_failure_error.startswith("workspace: ")
+        # Guard must not block on the workspace-prefixed error.
+        assert kb.check_respawn_guard(conn, tid) is None
+
+        # Operator fixes the path in the DB — no error/counter cleanup needed.
+        kb.set_workspace_path(conn, tid, str(good_path))
+
+        # Next tick: spawns.
+        res2 = kb.dispatch_once(
+            conn, spawn_fn=lambda task, workspace, board=None: 4242,
+            max_spawn=1,
+        )
+        task2 = kb.get_task(conn, tid)
+        assert res2.spawned == [(tid, "alice", task2.workspace_path)]
 
 
 # ---------------------------------------------------------------------------
