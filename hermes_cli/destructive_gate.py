@@ -143,6 +143,29 @@ LIVE_RESOURCE_MARKERS = (
     " user", " users",
 )
 
+# Live INFRA resource markers that alone signal a live target when the verb
+# vocabulary misses the destructive verb (UNKNOWN/ambiguity => DESTRUCTIVE_LIVE,
+# never guess SAFE: "erase the production bucket" / "terminate the live R2
+# object storage" / "rm -rf the live bucket" must still require a human GO).
+# The v1.1 IDENTITY markers ("credential"/"secret"/"api key"/"user") are NOT
+# listed here: they only signal a destructive target when a destructive verb is
+# present (the classifier requires both), so a benign card like "Add user
+# profile page" stays SAFE.
+_LIVE_INFRA_MARKERS = (
+    # object storage / infra
+    "bucket", "r2", "s3", "object storage",
+    # tenants / multi-tenancy
+    "tenant", "tenants",
+    # environment
+    "live", " prod", "(prod", " production", " production)",
+    # databases / schemas
+    "database", "schema", " table", " index", " collection",
+    "postgres", "supabase", "migration", "migrations",
+    # deployment / service / infra
+    "deployment", "service", "infra", "infrastructure",
+    "cloudflare", "dns record", "route53",
+)
+
 # Explicit directive that overrides heuristics (any hit => DESTRUCTIVE_LIVE).
 EXPLICIT_DIRECTIVES = (
     "destructive_action",
@@ -207,6 +230,13 @@ def _has_live_marker(title: str, body: str) -> bool:
     return any(m in low for m in LIVE_RESOURCE_MARKERS)
 
 
+def _has_infra_live_marker(title: str, body: str) -> bool:
+    """True when the text references live INFRA structure (bucket/tenant/db/
+    prod/infra/...) without requiring a destructive verb to be meaningful."""
+    low = (title + "\n" + body).lower()
+    return any(m in low for m in _LIVE_INFRA_MARKERS)
+
+
 def compile_allowlist(entries: Any) -> List[tuple[Pattern[str], str]]:
     """Compile explicit benign-operation patterns from config.
 
@@ -242,7 +272,14 @@ def compile_allowlist(entries: Any) -> List[tuple[Pattern[str], str]]:
 
 
 def _classify(title: str, body: str, *, strict: bool = False) -> Verdict:
-    """Classify a card as destructive-live or safe. Pure + deterministic."""
+    """Classify a card as destructive-live or safe. Pure + deterministic.
+
+    UNKNOWN/ambiguity => DESTRUCTIVE_LIVE: a live INFRA resource marker
+    (bucket/tenant/db/prod/infra/...) without a recognised destructive verb
+    ("erase", "terminate", "rm -rf", ...) still requires a human GO — the
+    vocabulary must never silently turn a possibly-destructive live card
+    into SAFE.
+    """
     reasons: List[str] = []
     text = title + "\n" + body
 
@@ -258,11 +295,18 @@ def _classify(title: str, body: str, *, strict: bool = False) -> Verdict:
             reasons.append("destructive verb on strict productive board")
             return Verdict(DESTRUCTIVE_LIVE, reasons)
         reasons.append("destructive verb present but no live-resource marker")
+        return Verdict(SAFE, reasons + ["not destructive-live"])
 
-    # No destructive verb, or a verb without a live target => not gated.
-    if not reasons:
-        return Verdict(SAFE, ["no destructive-live signal"])
-    return Verdict(SAFE, reasons + ["not destructive-live"])
+    # No known destructive verb. A live INFRA marker without a matched verb
+    # is UNKNOWN/ambiguity => DESTRUCTIVE_LIVE (fail-closed, never guess SAFE).
+    if _has_infra_live_marker(title, body):
+        reasons.append(
+            "live-resource marker without known destructive verb "
+            "(UNKNOWN => DESTRUCTIVE_LIVE)"
+        )
+        return Verdict(DESTRUCTIVE_LIVE, reasons)
+
+    return Verdict(SAFE, ["no destructive-live signal"])
 
 
 def _is_human_go(body: str, task_id: str) -> bool:
@@ -331,9 +375,15 @@ def _human_go_comment_bodies(conn, task_id, *, assignee: Optional[str] = None, d
         body = (r["body"] or "").strip()
         if not _is_human_go(body, task_id):
             continue
+        if not author:
+            # Empty/NULL author can never be a human GO (fail-closed,
+            # consistent with author_is_denied()). The READ path must be as
+            # strict as the write path: a GO row inserted via SQL/dashboard
+            # without an author must not satisfy the gate.
+            continue
         if author.lower() in denied:
             continue  # system/dashboard/worker-authored GO is not a human GO
-        if assignee and author and author.lower() == str(assignee).lower():
+        if assignee and author.lower() == str(assignee).lower():
             continue  # self-authored GO by the executor is not a human GO
         out.append(body)
     return out
@@ -579,7 +629,11 @@ def _is_stale_authorized(conn, task_id: str, auth_event: dict, *, ttl_seconds: i
         so the old GO must not cover it.
     """
     created = auth_event.get("created_at") or 0
-    if ttl_seconds and ttl_seconds > 0 and (int(time.time()) - created) > ttl_seconds:
+    # ttl_seconds == 0 is a zero-tolerance window: any elapsed second makes
+    # the GO stale (fail-closed — a zero-length validity interval must never
+    # balloon into "never expires"). Negative TTL is not produced by config
+    # (minimum=0); None is normalised to the default by the caller.
+    if ttl_seconds is not None and ttl_seconds >= 0 and (int(time.time()) - created) > ttl_seconds:
         return True, f"authorized event older than ttl {ttl_seconds}s"
     try:
         rows = conn.execute(
@@ -657,25 +711,34 @@ def claim_gate_verdict(
     require_preverify: bool = False, authorized_ttl_seconds: Optional[int] = None,
     denylist_authors: Optional[Any] = None,
 ) -> Optional[dict]:
-    """Admission decision for CLAIMING a destructive-live card.
+    """Admission decision for CLAIMING a destructive-live card (fail-closed).
 
     ``None`` -> allow the claim. ``{"cls","reason","guidance"}`` -> block.
 
-    Fail-closed ordering (each rule independent):
-      1. If the card is destructive-live in scope and the mechanism is active:
-      2. ``require_preverify=True``  -> a ``destructive_preverified`` event for
-         the CURRENT action_id must exist BEFORE any ``destructive_authorized``
-         event (``id_authorized > id_preverified``), else the pre-action
-         ordering is violated.
-      3. A canonical ``destructive_authorized`` event for the current
-         action_id is the ONLY source of truth; a legacy GO comment without
-         the event does not count when an action binding exists or the
-         mechanism is strict. With ``require_preverify=False`` and no declared
-         action_id, a legacy GO comment (author != executor, not denied) is
-         still honored for backward compatibility.
-      4. A stale GO (TTL or edited-after-GO) blocks; a GO for a DIFFERENT
-         action_id (card edited post-GO) blocks with ``mismatched GO``.
+    Any unexpected internal error degrades to a block (never allow), the same
+    fail-closed bias as ``destructive_gate_requires_go``: a bug in the gate
+    can never admit a destructive action without a human GO.
     """
+    try:
+        return _claim_gate_verdict_impl(
+            conn, task_id, board=board, strict=strict,
+            allowlist=allowlist, tenant_scope=tenant_scope,
+            require_preverify=require_preverify,
+            authorized_ttl_seconds=authorized_ttl_seconds,
+            denylist_authors=denylist_authors,
+        )
+    except Exception as exc:
+        return _block("DESTRUCTIVE_LIVE", f"destructive gate internal error: {exc}")
+
+
+def _claim_gate_verdict_impl(
+    conn, task_id: str, *, board: Optional[str] = None, strict: bool = False,
+    allowlist: Optional[Any] = None, tenant_scope: Any = (),
+    require_preverify: bool = False, authorized_ttl_seconds: Optional[int] = None,
+    denylist_authors: Optional[Any] = None,
+) -> Optional[dict]:
+    """Fail-closed ordering for the claim guard (implemented body; see the
+    public ``claim_gate_verdict`` wrapper for the contract)."""
     scope = _resolve_scope(conn, task_id, strict=strict, allowlist=allowlist, tenant_scope=tenant_scope)
     if scope is None:
         return None  # allow (not destructive-live in scope, or allowlisted)
@@ -683,8 +746,8 @@ def claim_gate_verdict(
         return scope["error"]
 
     action_id = scope["action_id"]
-    auth = latest_destructive_event(conn, task_id, "destructive_authorized")
     denylist = list(denylist_authors) if denylist_authors else list(_AUTHOR_DENYLIST_DEFAULT)
+    auth = latest_destructive_event(conn, task_id, "destructive_authorized")
 
     if require_preverify:
         pre = latest_destructive_event(conn, task_id, "destructive_preverified")
@@ -693,6 +756,19 @@ def claim_gate_verdict(
                 "DESTRUCTIVE_LIVE",
                 "GO ordering requires pre-verification first (no "
                 f"destructive_preverified event for action_id {action_id})",
+            )
+        # Defense in depth: the pre-verification must itself have been
+        # recorded by a non-denied, non-executor author — the READ path is as
+        # strict as the write path (``record_destructive_event`` can be
+        # invoked directly, bypassing the CLI's author checks).
+        pre_author = (pre["payload"].get("author") or pre["payload"].get("by") or "").strip()
+        if author_is_denied(pre_author, assignee=scope["assignee"], denylist=denylist):
+            return _block(
+                "DESTRUCTIVE_LIVE",
+                "pre-verification recorded by a denied/executor identity "
+                f"(author {pre_author!r}) — re-run "
+                "`hermes kanban preverify-destructive` with a human operator "
+                "author",
             )
         if auth is None or auth["id"] <= pre["id"]:
             if auth is None:
@@ -703,13 +779,13 @@ def claim_gate_verdict(
                 f"(destructive_authorized event {auth['id']} recorded before "
                 f"destructive_preverified event {pre['id']})",
             )
-        return _claim_authorized_gate(conn, scope, auth, ttl=authorized_ttl_seconds)
+        return _claim_authorized_gate(conn, scope, auth, ttl=authorized_ttl_seconds, denylist=denylist)
 
     # Legacy-compatible path (require_preverify=False).
     if auth is not None:
         # A canonical event (the operator used approve-destructive) is the
         # source of truth: it must match the current action and not be stale.
-        return _claim_authorized_gate(conn, scope, auth, ttl=authorized_ttl_seconds)
+        return _claim_authorized_gate(conn, scope, auth, ttl=authorized_ttl_seconds, denylist=denylist)
     if scope["declared"]:
         # Card declares an action binding; a legacy GO without action_id
         # cannot authorize it — the operator must use the v1.1 flow.
@@ -721,15 +797,19 @@ def claim_gate_verdict(
         )
     go_comments = _human_go_comment_bodies(conn, task_id, assignee=scope["assignee"], denylist=denylist)
     valid, mismatched = _partition_go_comments(go_comments, scope["action_id"])
-    if valid:
-        return None  # legacy human GO comment (author != executor) honored
     if mismatched:
+        # A v1.1 GO bound to a DIFFERENT action is decisive over any legacy GO
+        # coexisting on the card ("al convivir ambos, el que manda es el de
+        # v1.1 con action_id"): the requested action is not covered by a valid
+        # GO, so the claim is refused (fail-closed).
         return _block(
             "DESTRUCTIVE_LIVE",
             f"stale or mismatched GO for action (recorded GO binds "
             f"action_id {mismatched!r}, current action is "
             f"{scope['action_id']!r})",
         )
+    if valid:
+        return None  # legacy human GO comment (author != executor) honored
     return _block("DESTRUCTIVE_LIVE", "NO recorded human GO")
 
 
@@ -755,11 +835,13 @@ def _partition_go_comments(go_comments: List[str], action_id: str) -> tuple[list
     return valid, mismatch
 
 
-def _claim_authorized_gate(conn, scope: dict, auth: dict, *, ttl: Optional[int]) -> Optional[dict]:
+def _claim_authorized_gate(conn, scope: dict, auth: dict, *, ttl: Optional[int],
+                           denylist: Optional[Any] = None) -> Optional[dict]:
     """Validate an existing canonical authorized event against the card.
 
     Returns ``None`` when the GO is valid for the current action, or a
-    ``{"cls","reason","guidance"}`` block dict when it is mismatched or stale.
+    ``{"cls","reason","guidance"}`` block dict when it is mismatched,
+    recorded by a denied/executor identity, or stale.
     """
     action_id = scope["action_id"]
     if auth["payload"].get("action_id") != action_id:
@@ -768,6 +850,17 @@ def _claim_authorized_gate(conn, scope: dict, auth: dict, *, ttl: Optional[int])
             f"stale or mismatched GO for action (authorized action_id "
             f"{auth['payload'].get('action_id')!r} != current "
             f"{action_id!r})",
+        )
+    # Defense in depth: the event's author must be a non-denied, non-executor
+    # human — the READ path is as strict as the write path
+    # (``record_destructive_event`` can be invoked directly, bypassing the
+    # denylist/executor checks that ``add_comment`` enforces).
+    author = (auth["payload"].get("author") or auth["payload"].get("by") or "").strip()
+    if author_is_denied(author, assignee=scope["assignee"], denylist=denylist):
+        return _block(
+            "DESTRUCTIVE_LIVE",
+            f"GO recorded by a denied/executor identity (author {author!r}) — "
+            "re-record the GO with `hermes kanban approve-destructive`",
         )
     ttl_seconds = ttl if ttl is not None else DEFAULT_AUTHORIZED_TTL_SECONDS
     stale, why = _is_stale_authorized(conn, scope["task_id"], auth, ttl_seconds=ttl_seconds)
@@ -782,7 +875,7 @@ def completion_gate_verdict(
     require_preverify: bool = False, authorized_ttl_seconds: Optional[int] = None,
     denylist_authors: Optional[Any] = None,
 ) -> Optional[dict]:
-    """Admission decision for COMPLETING a destructive-live card.
+    """Admission decision for COMPLETING a destructive-live card (fail-closed).
 
     ``None`` -> allowed (no tracing metadata needed). Otherwise a dict:
 
@@ -791,10 +884,30 @@ def completion_gate_verdict(
         ``postverified_event_id`` for the closing run's metadata.
       * ``{"allowed": False, "cls", "reason", "guidance"}`` -> block.
 
-    Requirements (fail-closed): a canonical human GO for the current
-    action_id (stale/mismatched GO still blocks), then a
-    ``destructive_postcondition_posted`` event recorded AFTER the GO.
+    Any unexpected internal error degrades to a block (never allow): a bug in
+    the gate can never close a destructive card without the human-GO +
+    postcondition chain.
     """
+    try:
+        return _completion_gate_verdict_impl(
+            conn, task_id, board=board, strict=strict,
+            allowlist=allowlist, tenant_scope=tenant_scope,
+            require_preverify=require_preverify,
+            authorized_ttl_seconds=authorized_ttl_seconds,
+            denylist_authors=denylist_authors,
+        )
+    except Exception as exc:
+        return {"allowed": False, **_block("DESTRUCTIVE_LIVE", f"destructive gate internal error: {exc}")}
+
+
+def _completion_gate_verdict_impl(
+    conn, task_id: str, *, board: Optional[str] = None, strict: bool = False,
+    allowlist: Optional[Any] = None, tenant_scope: Any = (),
+    require_preverify: bool = False, authorized_ttl_seconds: Optional[int] = None,
+    denylist_authors: Optional[Any] = None,
+) -> Optional[dict]:
+    """Implemented body of the completion guard (see the public
+    ``completion_gate_verdict`` wrapper for the contract)."""
     scope = _resolve_scope(conn, task_id, strict=strict, allowlist=allowlist, tenant_scope=tenant_scope)
     if scope is None:
         return None
@@ -802,18 +915,17 @@ def completion_gate_verdict(
         return {"allowed": False, **scope["error"]}
 
     action_id = scope["action_id"]
-    auth = latest_destructive_event(conn, task_id, "destructive_authorized")
     denylist = list(denylist_authors) if denylist_authors else list(_AUTHOR_DENYLIST_DEFAULT)
+    auth = latest_destructive_event(conn, task_id, "destructive_authorized")
 
     if auth is None:
         if not require_preverify and not scope["declared"]:
             # Legacy-compat completion: a legacy GO comment (author !=
             # executor, not denied) suffices when no action binding exists;
-            # a v1.1 GO comment bound to a DIFFERENT action does not.
+            # a v1.1 GO comment bound to a DIFFERENT action does not (it is
+            # decisive over any coexistent legacy GO — fail-closed).
             go_comments = _human_go_comment_bodies(conn, task_id, assignee=scope["assignee"], denylist=denylist)
             valid, mismatched = _partition_go_comments(go_comments, scope["action_id"])
-            if valid:
-                return {"allowed": True, "meta": None}
             if mismatched:
                 return {
                     "allowed": False,
@@ -824,9 +936,11 @@ def completion_gate_verdict(
                         f"{scope['action_id']!r})",
                     ),
                 }
+            if valid:
+                return {"allowed": True, "meta": None}
         return {"allowed": False, **_block("DESTRUCTIVE_LIVE", "no recorded human GO")}
 
-    blocked = _claim_authorized_gate(conn, scope, auth, ttl=authorized_ttl_seconds)
+    blocked = _claim_authorized_gate(conn, scope, auth, ttl=authorized_ttl_seconds, denylist=denylist)
     if blocked is not None:
         return {"allowed": False, **blocked}
 

@@ -241,3 +241,38 @@ def test_declared_action_id_wins_over_derived_digest():
            "destructive_tenant: CLIENT_A"
     assert compute_destructive_action_id("Cleanup", body, tenant="WHATEVER", assignee="dev") \
         == "sha256:declaredabc"
+
+
+# ────────────────── v1.1 fail-closed vocabulary (QA rework) ──────────────────
+
+
+def test_classify_unknown_destructive_verb_live_marker_blocks():
+    """Verbs outside DESTRUCTIVE_VERBS that act on a live INFRA resource must
+    NOT fall through to SAFE — UNKNOWN/ambiguity => DESTRUCTIVE_LIVE
+    (reproduces QA findings: erase/terminate/rm -rf were SAFE)."""
+    v1 = _classify("Erase the production bucket",
+                   "Erase the R2 bucket erp-client-a-docs before migration.")
+    assert v1.cls == DESTRUCTIVE_LIVE
+    assert "UNKNOWN => DESTRUCTIVE_LIVE" in "; ".join(v1.reasons)
+    v2 = _classify("Terminate the live R2 object storage",
+                   "Terminate the live R2 object storage endpoint CLIENT_A.")
+    assert v2.cls == DESTRUCTIVE_LIVE
+    v3 = _classify("rm -rf the live bucket", "rm -rf the live bucket r2://erp-client-a-docs")
+    assert v3.cls == DESTRUCTIVE_LIVE
+
+
+def test_classify_infra_marker_without_verb_conservative():
+    """A live INFRA resource marker without any known destructive verb is
+    ambiguous => gated (conservative, fail-closed)."""
+    v = _classify("Update the production deployment",
+                  "Update the production deployment notes and status page.")
+    assert v.cls == DESTRUCTIVE_LIVE
+    assert "UNKNOWN => DESTRUCTIVE_LIVE" in "; ".join(v.reasons)
+
+
+def test_classify_identity_marker_without_verb_is_safe():
+    """v1.1 IDENTITY markers (user/credential/secret/api key) only signal a
+    destructive target WITH a destructive verb — a benign feature card like
+    'Add user profile page' must stay SAFE (no infra marker, no verb)."""
+    v = _classify("Add user profile page", "Add a new user profile page to the app.")
+    assert v.cls == SAFE

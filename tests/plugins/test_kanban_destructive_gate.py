@@ -525,4 +525,187 @@ def test_cli_approve_rejects_spoofed_author(board_home, monkeypatch, capsys):
     assert evs == []
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# QA rework — regression tests for the adversarial findings (t_5c30c4de)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_claim_blocked_missing_task(board_home, monkeypatch):
+    """Nonexistent task => the gate fails closed with an actionable reason
+    (card not found), never admits a claim on a phantom id."""
+    _set_destructive_config(monkeypatch)
+    from hermes_cli.destructive_gate import claim_gate_verdict
+
+    with kb.connect_closing() as conn:
+        verdict = claim_gate_verdict(conn, "t_ghost")
+    assert verdict is not None
+    assert "card not found" in verdict["reason"]
+
+
+def test_completion_blocked_missing_task(board_home, monkeypatch):
+    """Nonexistent task => completion verdict blocks (allowed=False)."""
+    _set_destructive_config(monkeypatch)
+    from hermes_cli.destructive_gate import completion_gate_verdict
+
+    with kb.connect_closing() as conn:
+        verdict = completion_gate_verdict(conn, "t_ghost")
+    assert verdict is not None
+    assert verdict.get("allowed") is False
+    assert "card not found" in verdict["reason"]
+
+
+def test_legacy_go_empty_author_not_counted(board_home, monkeypatch):
+    """A legacy GO comment with EMPTY/whitespace author (inserted via SQL,
+    bypassing add_comment's author validation; the schema forbids NULL) must
+    NOT satisfy the gate — the read path is as strict as the write path
+    (QA finding #1)."""
+    _set_destructive_config(monkeypatch)  # require_preverify=False, undeclared
+    from hermes_cli.destructive_gate import claim_gate_verdict
+
+    for author in ("", "   "):
+        tid = "d14" if author == "" else "d14w"
+        with kb.connect() as conn:
+            _destructive_card(conn, tid, tenant="CLIENT_A")
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?,?,?,?)",
+                (tid, author, "@go destructive " + tid, int(__import__("time").time())),
+            )
+        with kb.connect_closing() as conn:
+            verdict = claim_gate_verdict(conn, tid)
+        assert verdict is not None
+        assert "NO recorded human GO" in verdict["reason"]
+
+
+def test_claim_blocked_ttl_zero_fail_closed(board_home, monkeypatch):
+    """TTL=0 is a zero-tolerance window: any elapsed second invalidates the GO
+    (fail-closed — a zero-length validity interval must never mean 'never
+    expires')."""
+    _set_destructive_config(monkeypatch, destructive_require_preverify=True,
+                            destructive_authorized_ttl_seconds=0)
+    with kb.connect() as conn:
+        _destructive_card(conn, "d15", tenant="CLIENT_A")
+        _record_full_sequence(conn, "d15")
+        # Re-age the authorized event 1s into the past so elapsed > 0.
+        conn.execute(
+            "UPDATE task_events SET created_at = ? "
+            "WHERE kind='destructive_authorized' AND task_id='d15'",
+            (int(__import__("time").time()) - 1,),
+        )
+    with kb.connect_closing() as conn:
+        claimed = kb.claim_task(conn, "d15")
+    assert claimed is None
+    with kb.connect() as conn:
+        held = list(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id='d15' AND kind='destructive_gate_held'",
+        ))
+    assert held and "stale" in (held[0]["payload"] or "")
+
+
+def test_legacy_go_coexisting_with_mismatched_v11_go_blocked(board_home, monkeypatch):
+    """Undeclared card with BOTH a valid legacy GO and a v1.1 GO bound to a
+    DIFFERENT action => claim blocked (mismatch). The v1.1 bound GO is
+    decisive over the legacy one — the requested action is not covered by a
+    valid GO (QA finding: _partition_go_comments mismatch branch)."""
+    _set_destructive_config(monkeypatch)
+    from hermes_cli.destructive_gate import claim_gate_verdict
+
+    with kb.connect() as conn:
+        _destructive_card(conn, "d17", tenant="CLIENT_A")
+        _derived = _derived_action_id(conn, "d17")
+        assert _derived != "sha256:wrong1"
+        for body in ("@go destructive d17", "@go destructive d17 sha256:wrong1"):
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?,?,?,?)",
+                ("d17", "operator@lab", body, int(__import__("time").time())),
+            )
+    with kb.connect_closing() as conn:
+        verdict = claim_gate_verdict(conn, "d17")
+    assert verdict is not None
+    assert "mismatched" in verdict["reason"]
+
+
+def test_preverified_by_denied_author_blocked(board_home, monkeypatch):
+    """Defense in depth: a destructive_preverified event recorded with a
+    denied/executor/empty author must NOT satisfy the strict ordering — the
+    read path validates author (QA finding #4)."""
+    _set_destructive_config(monkeypatch, destructive_require_preverify=True)
+    from hermes_cli.destructive_gate import claim_gate_verdict
+
+    for by_author in ("dev", "worker", "", "dashboard"):
+        tid = "d18_" + (by_author or "none")
+        with kb.connect() as conn:
+            _destructive_card(conn, tid, tenant="CLIENT_A")
+            action_id = _derived_action_id(conn, tid)
+            kb.record_destructive_event(conn, tid, "destructive_preverified",
+                                        action_id, author=by_author, by=by_author)
+        with kb.connect_closing() as conn:
+            verdict = claim_gate_verdict(conn, tid, require_preverify=True)
+        assert verdict is not None
+        assert ("denied" in verdict["reason"] or "pre-verification" in verdict["reason"])
+
+
+def test_authorized_event_by_denied_author_blocked(board_home, monkeypatch):
+    """A canonical destructive_authorized event whose payload author is a
+    denied/executor identity (recorded directly via record_destructive_event,
+    bypassing add_comment) must not admit the claim/completion — the READ path
+    validates the author (QA finding #4)."""
+    _set_destructive_config(monkeypatch)
+    from hermes_cli.destructive_gate import claim_gate_verdict, completion_gate_verdict
+
+    with kb.connect() as conn:
+        _destructive_card(conn, "d19", tenant="CLIENT_A")
+        action_id = _derived_action_id(conn, "d19")
+        kb.record_destructive_event(conn, "d19", "destructive_authorized", action_id,
+                                    author="worker", by="")
+    with kb.connect_closing() as conn:
+        verdict = claim_gate_verdict(conn, "d19")
+    assert verdict is not None
+    assert "denied" in verdict["reason"]
+    with kb.connect_closing() as conn:
+        verdict = completion_gate_verdict(conn, "d19")
+    assert verdict is not None and verdict.get("allowed") is False
+    assert "denied" in verdict["reason"]
+
+
+def test_claim_verdict_degrades_to_block_on_internal_error(board_home, monkeypatch):
+    """Catch-all: any internal error in the claim gate degrades to a block
+    (never allow) — same fail-closed bias as destructive_gate_requires_go
+    (QA finding #3)."""
+    _set_destructive_config(monkeypatch)
+    from hermes_cli import destructive_gate as dg
+
+    with kb.connect() as conn:
+        _destructive_card(conn, "d20", tenant="CLIENT_A")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(dg, "latest_destructive_event", boom)
+    with kb.connect_closing() as conn:
+        verdict = dg.claim_gate_verdict(conn, "d20")
+    assert verdict is not None
+    assert "internal error" in verdict["reason"]
+
+
+def test_completion_verdict_degrades_to_block_on_internal_error(board_home, monkeypatch):
+    """Catch-all: any internal error in the completion gate degrades to a
+    block (never allow) (QA finding #3)."""
+    _set_destructive_config(monkeypatch)
+    from hermes_cli import destructive_gate as dg
+
+    with kb.connect() as conn:
+        _destructive_card(conn, "d21", tenant="CLIENT_A")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(dg, "latest_destructive_event", boom)
+    with kb.connect_closing() as conn:
+        verdict = dg.completion_gate_verdict(conn, "d21")
+    assert verdict is not None
+    assert verdict.get("allowed") is False
+    assert "internal error" in verdict["reason"]
+
+
 from pathlib import Path  # noqa: E402  (needed by the board_home fixture)

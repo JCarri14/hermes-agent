@@ -317,6 +317,15 @@ denylisted identity (`kanban.destructive_go_denylist_authors`: dashboard,
 worker, hermes-system, system, specifier, decomposer, auto-decomposer). A
 worker or the dashboard can never self-GO; a GO recorded by direct SQL or the
 dashboard POST produces no event and is therefore ignored on gated boards.
+The read paths enforce the same author rules as the write paths: a GO comment
+with an empty author, or an event recorded by a denied/executor identity
+(via a direct `record_destructive_event` call), never satisfies the gate.
+
+Classification is fail-closed by vocabulary: a card referencing live INFRA
+structure (bucket, tenant, db, prod, infra, ...) with a verb outside the
+recognised destructive vocabulary ("erase", "terminate", "rm -rf", ...) is
+still treated as DESTRUCTIVE_LIVE — UNKNOWN/ambiguity never falls through to
+SAFE, it requires a human GO (or an explicit allowlist entry).
 
 New config keys (defaults preserve existing behaviour; `destructive_gate`
 stays OFF by default):
@@ -328,6 +337,10 @@ kanban:
   destructive_require_preverify: false          # true on productive_boards
   destructive_go_denylist_authors: [dashboard, worker, hermes-system, ...]
 ```
+
+`destructive_authorized_ttl_seconds: 0` is a zero-tolerance window: any
+elapsed second invalidates the GO (fail-closed — a zero validity interval
+never means "never expires").
 
 Outside `productive_boards`, with `destructive_require_preverify: false`
 (the default), the legacy `@go destructive <task_id>` comment flow keeps
