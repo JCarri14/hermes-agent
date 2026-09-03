@@ -308,8 +308,14 @@ Enforcement is fail-closed and centralized:
   a `destructive_gate_held` event and actionable guidance.
 * **`complete_task`** refuses to close a destructive-live card without the
   canonical GO **and** a `destructive_postcondition_posted` event recorded
-  after it. The closing run's metadata carries `approved_action_id` /
-  `authorized_event_id` / `postverified_event_id` for traceability.
+  after it. The GO must also **predate the run start**: the closing run's
+  `task_runs.started_at` must be at-or-after the GO's recorded timestamp
+  (JCS-160 ex-post closure). A GO registered after the run that executed the
+  action started never satisfies the completion gate (fail-closed: if either
+  timestamp is missing and the ordering cannot be determined, completion is
+  blocked with guidance). The closing run's metadata carries
+  `approved_action_id` / `authorized_event_id` / `postverified_event_id` for
+  traceability.
 
 Author anti-spoofing: the `destructive_authorized` event is only created when
 the GO comment's author is **not** the card's assignee and **not** a
@@ -320,6 +326,23 @@ dashboard POST produces no event and is therefore ignored on gated boards.
 The read paths enforce the same author rules as the write paths: a GO comment
 with an empty author, or an event recorded by a denied/executor identity
 (via a direct `record_destructive_event` call), never satisfies the gate.
+
+Author anti-spoofing is defense in depth, not a root of trust: with the
+explicit non-goal of "no identity crypto", an operator with full control of
+the host (able to disable the environment guard or edit the config allowlist
+below) is outside the threat model. An operator-controlled positive allowlist
+hardens the read path further: when
+`kanban.destructive_go_allowlist_authors` is non-empty, the human-GO /
+pre-verification author MUST be listed or claim/completion fail closed with
+guidance (empty/default = no restriction). Environment-context guard: GO and
+pre-verification registration (`hermes kanban approve-destructive` /
+`preverify-destructive`, and any `record_destructive_event` call with an
+explicit author) is refused when the process runs inside a worker/dispatcher
+spawn — detectable because the dispatcher injects `HERMES_KANBAN_TASK` /
+`HERMES_KANBAN_WORKSPACE` / `HERMES_KANBAN_DB` into every worker it spawns
+(an operator's interactive terminal has none of them). A worker can therefore
+never record its own GO, even with a forged `--author` flag; the command
+fails with "record the GO from an operator terminal, not from a worker".
 
 Classification is fail-closed by vocabulary: a card referencing live INFRA
 structure (bucket, tenant, db, prod, infra, ...) with a verb outside the
@@ -336,6 +359,7 @@ kanban:
   destructive_authorized_ttl_seconds: 604800    # GO staleness (7 days)
   destructive_require_preverify: false          # true on productive_boards
   destructive_go_denylist_authors: [dashboard, worker, hermes-system, ...]
+  destructive_go_allowlist_authors: []          # non-empty = GO author MUST be listed
 ```
 
 `destructive_authorized_ttl_seconds: 0` is a zero-tolerance window: any
@@ -343,9 +367,15 @@ elapsed second invalidates the GO (fail-closed — a zero validity interval
 never means "never expires").
 
 Outside `productive_boards`, with `destructive_require_preverify: false`
-(the default), the legacy `@go destructive <task_id>` comment flow keeps
-working for cards that do not declare an action binding — only boards that
-opt in get the stricter deterministic mechanism. See the plan
+(the default), the legacy `@go destructive <task_id>` comment (no event, no
+`action_id` binding) is honored **only as a documented backward-compatibility
+fallback** for cards that do not declare an action binding. The canonical
+mechanism — and the only one that satisfies a *declared* action — is the
+`destructive_authorized` event with an `action_id` (recorded by
+`approve-destructive`), which the legacy path never emits. A resolution
+failure in the kanban config never disables the gate: it forces the strictest
+fail-closed posture (pre-verification required, strict classification) with a
+diagnostic event, never a silent SAFE. See the plan
 `.hermes/plans/2026-09-02_101500-pre-action-destructive-gate-policy-v1.1.md`
 for the full policy.
 

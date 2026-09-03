@@ -4438,10 +4438,21 @@ def record_destructive_event(
 
     Returns the event row id (new or existing).
     """
-    from hermes_cli.destructive_gate import DESTRUCTIVE_EVENT_KINDS
+    from hermes_cli.destructive_gate import (
+        DESTRUCTIVE_EVENT_KINDS,
+        worker_env_guard_reason,
+    )
 
     if kind not in DESTRUCTIVE_EVENT_KINDS:
         raise ValueError(f"unknown destructive event kind: {kind!r}")
+    # HIGH-1 env-context guard: a GO / pre-verification / postcondition must be
+    # recorded from an operator terminal, never from inside a worker/dispatcher
+    # spawn (the dispatcher injects HERMES_KANBAN_TASK / WORKSPACE / DB into
+    # every worker it spawns; an interactive operator terminal has none). An
+    # explicit author paired with a worker env is a self-authorization attempt
+    # — fail-closed with actionable guidance.
+    if (author or by) and worker_env_guard_reason():
+        raise DestructiveGateError(worker_env_guard_reason())
     action_id = (action_id or "").strip()
     if not action_id:
         raise ValueError("action_id is required")
@@ -4848,7 +4859,10 @@ def claim_task(
                 conn, task_id, board=get_current_board(), force=destructive_gate,
             )
             if _dg_reason is not None:
-                _append_event(
+                # WARN-5: deduplicated by (card, gating reason) — repeated
+                # blocked attempts from the dispatcher ticks or multiple claim
+                # surfaces must not spam the event log with identical rows.
+                _append_diagnostic_dedup(
                     conn, task_id, "destructive_gate_held",
                     {
                         "class": "DESTRUCTIVE_LIVE",
@@ -10550,12 +10564,21 @@ def _kanban_destructive_policy(board: Optional[str] = None, *, force: Optional[b
       * ``require_preverify`` defaults to False outside productive boards;
       * ``authorized_ttl_seconds`` defaults to 7 days;
       * ``denylist`` defaults to ``destructive_go_denylist_authors`` (or the
-        module default when unset).
+        module default when unset);
+      * ``go_allowlist`` defaults to ``destructive_go_allowlist_authors``
+        (empty = no operator allowlist restriction; non-empty = the human-GO
+        author must be listed, fail-closed on read).
 
-    Fail-safe: a config load error degrades to gate OFF (existing behaviour)
-    so a broken config file can never start blocking claims on its own.
+    Fail-closed (WARN-4): a config load error must NEVER silently disable the
+    gate. ``load_config`` normally honours defaults for an absent file, so
+    reaching the exception branch means real breakage — the gate is forced ON
+    with the strictest posture (pre-verification required, strict
+    classification) and ``config_error`` is returned so callers can surface an
+    event/guidance. ``force=False`` remains an explicit opt-out for callers
+    that pin the gate off on purpose (tests, ``--no-gate``-style flags).
     """
     base: dict = {}
+    config_error: Optional[str] = None
     try:
         from hermes_cli.config import load_config
 
@@ -10563,8 +10586,10 @@ def _kanban_destructive_policy(board: Optional[str] = None, *, force: Optional[b
         kc = cfg.get("kanban") or {}
         if isinstance(kc, dict):
             base = kc
-    except Exception:
-        pass
+        else:
+            config_error = "kanban config section is not a mapping"
+    except Exception as exc:
+        config_error = f"kanban config load failed: {exc}"
     productive = base.get("productive_boards") or []
     if not isinstance(productive, list):
         productive = []
@@ -10575,7 +10600,10 @@ def _kanban_destructive_policy(board: Optional[str] = None, *, force: Optional[b
     elif force is False:
         gate_on = False
     else:
-        gate_on = bool(base.get("destructive_gate", False)) or is_productive
+        # WARN-4: on a config resolution error the gate is forced ACTIVE (with
+        # the strictest posture below) — a broken config can never silently
+        # disable the pre-action destructive gate.
+        gate_on = bool(base.get("destructive_gate", False)) or is_productive or bool(config_error)
     tenants = base.get("destructive_tenants") or []
     if not isinstance(tenants, list):
         tenants = []
@@ -10587,12 +10615,16 @@ def _kanban_destructive_policy(board: Optional[str] = None, *, force: Optional[b
         except Exception:
             denylist = ["dashboard", "worker", "hermes-system", "system",
                         "specifier", "decomposer", "auto-decomposer"]
+    go_allowlist = base.get("destructive_go_allowlist_authors") or []
+    if not isinstance(go_allowlist, list):
+        go_allowlist = []
     # The gate is deliberately lenient OUTSIDE its explicit activation scope;
-    # productive boards are never lenient about pre-verification.
-    require_preverify = bool(base.get("destructive_require_preverify", False)) or is_productive
+    # productive boards are never lenient about pre-verification. A config
+    # resolution error is never lenient about anything (fail-closed).
+    require_preverify = bool(base.get("destructive_require_preverify", False)) or is_productive or bool(config_error)
     return {
         "gate_on": gate_on,
-        "strict": is_productive,
+        "strict": is_productive or bool(config_error),
         "allowlist": base.get("destructive_allowlist", []) or [],
         "tenant_scope": tenants,
         "require_preverify": require_preverify,
@@ -10602,7 +10634,44 @@ def _kanban_destructive_policy(board: Optional[str] = None, *, force: Optional[b
             minimum=0,
         ),
         "denylist": denylist,
+        "go_allowlist": go_allowlist,
+        "config_error": config_error,
     }
+
+
+def _append_diagnostic_dedup(conn, task_id: str, kind: str, payload: dict) -> bool:
+    """Append a diagnostic event, deduplicated by ``(kind, class, reason)``.
+
+    WARN-5: the dispatcher can evaluate the same held card every tick (and
+    ``claim_task`` can be called from multiple surfaces), which used to append
+    an identical ``destructive_gate_held`` event per attempt. Keeping the
+    latest identical event idempotent (same card + gating reason) makes the
+    event log a signal of state changes, not of tick volume.
+
+    Returns True when a new event was appended, False when the latest event of
+    ``kind`` already carries the same (class, reason) and nothing was written.
+    """
+    first_line = (str(payload.get("reason") or "") or str(payload.get("guidance") or "")).splitlines()[0]
+    try:
+        last = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, kind),
+        ).fetchone()
+    except Exception:
+        last = None
+    if last is not None and last["payload"]:
+        try:
+            prev = json.loads(last["payload"])
+        except (TypeError, ValueError):
+            prev = {}
+        if (
+            prev.get("class") == payload.get("class")
+            and (str(prev.get("reason") or "").splitlines()[0] == first_line)
+        ):
+            return False
+    _append_event(conn, task_id, kind, payload)
+    return True
 
 
 def _destructive_claim_requires_go(
@@ -10625,10 +10694,29 @@ def _destructive_claim_requires_go(
         allowlist=policy["allowlist"], tenant_scope=policy["tenant_scope"],
         require_preverify=policy["require_preverify"],
         authorized_ttl_seconds=policy["ttl"], denylist_authors=policy["denylist"],
+        go_allowlist_authors=policy["go_allowlist"],
     )
     if verdict is None:
+        # Admitted, but if the policy itself could not be resolved (WARN-4)
+        # surface a diagnostic event so operators see the gate ran fail-closed
+        # on degraded config instead of silently trusting half-loaded values.
+        if policy.get("config_error"):
+            _append_diagnostic_dedup(
+                conn, task_id, "destructive_config_error",
+                {
+                    "class": "DESTRUCTIVE_LIVE",
+                    "reason": f"config resolution error — gate ran in strict "
+                              f"fail-closed mode: {policy['config_error']}",
+                },
+            )
         return None
-    return verdict.get("guidance") or verdict.get("reason") or "destructive gate blocked"
+    msg = verdict.get("guidance") or verdict.get("reason") or "destructive gate blocked"
+    if policy.get("config_error"):
+        msg = (
+            f"destructive gate degraded to fail-closed strict mode because "
+            f"kanban config failed to resolve ({policy['config_error']})\n{msg}"
+        )
+    return msg
 
 
 def _destructive_completion_verified(
@@ -10653,11 +10741,18 @@ def _destructive_completion_verified(
         allowlist=policy["allowlist"], tenant_scope=policy["tenant_scope"],
         require_preverify=policy["require_preverify"],
         authorized_ttl_seconds=policy["ttl"], denylist_authors=policy["denylist"],
+        go_allowlist_authors=policy["go_allowlist"],
     )
     if verdict is None or verdict.get("allowed"):
         meta = verdict.get("meta") if verdict else None
         return meta if isinstance(meta, dict) else None
     guidance = verdict.get("guidance") or verdict.get("reason") or "destructive gate blocked"
+    if policy.get("config_error"):
+        guidance = (
+            f"destructive gate degraded to fail-closed strict mode because "
+            f"kanban config failed to resolve ({policy['config_error']})\n"
+            + guidance
+        )
     raise DestructiveGateError(guidance)
 
 
@@ -11103,13 +11198,19 @@ def _dispatch_once_locked(
             if _dg is not None:
                 cls_, reason = _dg
                 result.skipped_destructive_gate.append((row["id"], cls_))
-                # Emit a diagnostic event so operators can see why the card
-                # stayed ready without guessing. Never mutates claim state.
+                # Diagnostic event so operators can see why the card
+                # stayed ready without guessing (WARN-5: deduplicated by
+                # card + gating reason across ticks). Never mutates claim
+                # state.
                 if not dry_run:
                     with write_txn(conn):
-                        _append_event(
+                        _append_diagnostic_dedup(
                             conn, row["id"], "destructive_gate_held",
-                            {"class": cls_, "reason": reason},
+                            {
+                                "class": cls_,
+                                "reason": (reason or "destructive gate blocked").splitlines()[0],
+                                "guidance": reason or "destructive gate blocked",
+                            },
                         )
                 continue
         if dry_run:

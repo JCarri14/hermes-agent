@@ -13,7 +13,10 @@ from hermes_cli.destructive_gate import (
     compile_allowlist,
     evaluate,
     _classify,
+    _go_precedes_run_start,
     _is_human_go,
+    author_allowed_by_allowlist,
+    worker_env_guard_reason,
 )
 
 
@@ -276,3 +279,56 @@ def test_classify_identity_marker_without_verb_is_safe():
     'Add user profile page' must stay SAFE (no infra marker, no verb)."""
     v = _classify("Add user profile page", "Add a new user profile page to the app.")
     assert v.cls == SAFE
+
+
+# ─────────────────────── v1.2 adversarial fixes (pure units) ──────────────────
+
+def test_worker_env_guard_reason_detects_spawn_env(monkeypatch):
+    """HIGH-1: the env-context guard fires only when worker/dispatcher spawn
+    variables (HERMES_KANBAN_TASK / WORKSPACE / DB) are present — the exact
+    markers `agent/delegation_context.py` injects into real worker spawns."""
+    assert worker_env_guard_reason() is None  # operator terminal: no markers
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_x")
+    reason = worker_env_guard_reason()
+    assert reason is not None
+    assert "operator terminal" in reason
+    assert "HERMES_KANBAN_TASK" in reason
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", "/tmp/w")
+    assert worker_env_guard_reason() is not None
+    monkeypatch.delenv("HERMES_KANBAN_WORKSPACE")
+    monkeypatch.setenv("HERMES_KANBAN_DB", "/tmp/k.db")
+    assert worker_env_guard_reason() is not None
+
+
+def test_author_allowed_by_allowlist_fail_closed():
+    """HIGH-1 allowlist semantics: empty/unset -> unrestricted (compat);
+    non-empty -> exact case-insensitive membership; empty author never passes."""
+    assert author_allowed_by_allowlist("alice", go_allowlist=None) is True
+    assert author_allowed_by_allowlist("alice", go_allowlist=[]) is True
+    assert author_allowed_by_allowlist("alice", go_allowlist=["alice"]) is True
+    assert author_allowed_by_allowlist("ALICE", go_allowlist=["alice"]) is True
+    assert author_allowed_by_allowlist("bob", go_allowlist=["alice"]) is False
+    assert author_allowed_by_allowlist("", go_allowlist=["alice"]) is False
+    assert author_allowed_by_allowlist(None, go_allowlist=["alice"]) is False
+    assert author_allowed_by_allowlist("alice", go_allowlist=[" alice ", "bob"]) is True
+
+
+def test_go_precedes_run_start_ordering_fail_closed():
+    """HIGH-2 pure ordering: GO must be at-or-before the run start; missing
+    either timestamp (incl. zero) is fail-closed."""
+    ok, why = _go_precedes_run_start(100, 200)
+    assert ok is True and why == ""
+    ok, _ = _go_precedes_run_start(200, 200)  # boundary: at run start -> OK
+    assert ok is True
+    ok, why = _go_precedes_run_start(201, 200)  # ex-post -> blocked
+    assert ok is False
+    assert "AFTER the run" in why
+    ok, why = _go_precedes_run_start(None, 200)
+    assert ok is False and "missing" in why
+    ok, why = _go_precedes_run_start(100, None)
+    assert ok is False and "missing" in why
+    ok, why = _go_precedes_run_start(0, 200)  # zero timestamp = missing
+    assert ok is False and "missing" in why
+    ok, why = _go_precedes_run_start(100, 0)
+    assert ok is False and "missing" in why

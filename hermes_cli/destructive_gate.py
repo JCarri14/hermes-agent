@@ -347,15 +347,20 @@ def evaluate(inp: GateInput) -> Verdict:
 # ─────────────────────────── dispatcher-side helpers ───────────────────────────
 # Read-only: reads the card + comments; never writes.
 
-def _human_go_comment_bodies(conn, task_id, *, assignee: Optional[str] = None, denylist: Optional[Any] = None) -> List[str]:
+def _human_go_comment_bodies(conn, task_id, *, assignee: Optional[str] = None,
+                             denylist: Optional[Any] = None,
+                             go_allowlist: Optional[Any] = None) -> List[str]:
     """Return comment bodies that can serve as a human GO for ``task_id``.
 
     A GO comment must:
       - contain the canonical GO line (``@go destructive ...``),
       - NOT be authored by the card's assignee (a worker cannot
-        self-authorize), and
+        self-authorize),
       - NOT be authored by a denylisted system/dashboard/executor identity
-        (``denylist``; defaults to :data:`_AUTHOR_DENYLIST_DEFAULT`).
+        (``denylist``; defaults to :data:`_AUTHOR_DENYLIST_DEFAULT`), and
+      - when ``go_allowlist`` (operator-controlled
+        ``destructive_go_allowlist_authors``) is non-empty, be authored by a
+        listed identity (fail-closed: unlisted authors never satisfy the GO).
     """
     denied = {
         str(a).strip().lower()
@@ -385,6 +390,8 @@ def _human_go_comment_bodies(conn, task_id, *, assignee: Optional[str] = None, d
             continue  # system/dashboard/worker-authored GO is not a human GO
         if assignee and author.lower() == str(assignee).lower():
             continue  # self-authored GO by the executor is not a human GO
+        if not author_allowed_by_allowlist(author, go_allowlist=go_allowlist):
+            continue  # configured operator allowlist: unlisted author is not a human GO
         out.append(body)
     return out
 
@@ -480,6 +487,62 @@ def author_is_denied(author: Optional[str], *, assignee: Optional[str] = None,
     if assignee and a == str(assignee).strip().lower():
         return True
     return False
+
+
+# Env markers that the kanban dispatcher injects into every worker spawn
+# (``agent/delegation_context.py`` KANBAN_ENV_KEYS / scrub_kanban_env). A human
+# operator's interactive terminal does not carry them, so their presence is a
+# deterministic signal that this process is executing inside a
+# worker/dispatcher spawn — where recording a human GO would be
+# self-authorization. This is an env-context heuristic for defense in depth
+# (explicit non-goal: no identity crypto); it is NOT a root of trust.
+WORKER_ENV_MARKERS: tuple[str, ...] = (
+    "HERMES_KANBAN_TASK",
+    "HERMES_KANBAN_WORKSPACE",
+    "HERMES_KANBAN_DB",
+)
+
+
+def worker_env_guard_reason() -> Optional[str]:
+    """Return an actionable rejection reason when the process runs inside a
+    kanban worker/dispatcher spawn environment, else ``None``.
+
+    The dispatcher injects ``HERMES_KANBAN_TASK`` / ``HERMES_KANBAN_WORKSPACE``
+    / ``HERMES_KANBAN_DB`` into every worker it spawns and a human operator's
+    interactive terminal has none of them, so their presence means a GO /
+    pre-verification / postcondition recorded from here is a worker-side
+    self-authorization attempt (HIGH-1 fix, env-context guard).
+    """
+    import os
+
+    present = [k for k in WORKER_ENV_MARKERS if os.environ.get(k)]
+    if not present:
+        return None
+    return (
+        "GO / verification registration is blocked in this environment: "
+        "worker/dispatcher spawn variables are present "
+        f"({', '.join(sorted(present))}). Record the GO from an operator "
+        "terminal, not from a worker — an executor can never self-authorize "
+        "its own destructive action."
+    )
+
+
+def author_allowed_by_allowlist(author: Optional[str], *, go_allowlist: Optional[Any] = None) -> bool:
+    """Fail-closed operator allowlist on the human-GO author (HIGH-1 fix).
+
+    Empty / unset ``go_allowlist`` -> no restriction (default behaviour
+    preserved). Non-empty -> the author MUST be listed (case-insensitive); an
+    empty or unlisted author never passes. This is an operator-controlled
+    positive allowlist layered on the denylist, applied on the read paths
+    (claim + completion) exactly where ``author_is_denied`` is enforced.
+    """
+    if not go_allowlist:
+        return True
+    a = (author or "").strip().lower()
+    if not a:
+        return False
+    allowed = {str(x).strip().lower() for x in go_allowlist if str(x).strip()}
+    return a in allowed
 
 
 def _normalize_token(value: Optional[str]) -> str:
@@ -710,6 +773,7 @@ def claim_gate_verdict(
     allowlist: Optional[Any] = None, tenant_scope: Any = (),
     require_preverify: bool = False, authorized_ttl_seconds: Optional[int] = None,
     denylist_authors: Optional[Any] = None,
+    go_allowlist_authors: Optional[Any] = None,
 ) -> Optional[dict]:
     """Admission decision for CLAIMING a destructive-live card (fail-closed).
 
@@ -726,6 +790,7 @@ def claim_gate_verdict(
             require_preverify=require_preverify,
             authorized_ttl_seconds=authorized_ttl_seconds,
             denylist_authors=denylist_authors,
+            go_allowlist_authors=go_allowlist_authors,
         )
     except Exception as exc:
         return _block("DESTRUCTIVE_LIVE", f"destructive gate internal error: {exc}")
@@ -736,6 +801,7 @@ def _claim_gate_verdict_impl(
     allowlist: Optional[Any] = None, tenant_scope: Any = (),
     require_preverify: bool = False, authorized_ttl_seconds: Optional[int] = None,
     denylist_authors: Optional[Any] = None,
+    go_allowlist_authors: Optional[Any] = None,
 ) -> Optional[dict]:
     """Fail-closed ordering for the claim guard (implemented body; see the
     public ``claim_gate_verdict`` wrapper for the contract)."""
@@ -747,6 +813,7 @@ def _claim_gate_verdict_impl(
 
     action_id = scope["action_id"]
     denylist = list(denylist_authors) if denylist_authors else list(_AUTHOR_DENYLIST_DEFAULT)
+    go_allowlist = list(go_allowlist_authors) if go_allowlist_authors else None
     auth = latest_destructive_event(conn, task_id, "destructive_authorized")
 
     if require_preverify:
@@ -770,6 +837,14 @@ def _claim_gate_verdict_impl(
                 "`hermes kanban preverify-destructive` with a human operator "
                 "author",
             )
+        if not author_allowed_by_allowlist(pre_author, go_allowlist=go_allowlist):
+            return _block(
+                "DESTRUCTIVE_LIVE",
+                "pre-verification author is not in the configured "
+                f"destructive_go_allowlist_authors (author {pre_author!r}) — "
+                "add this operator to the allowlist or re-record the "
+                "pre-verification with an allowlisted author",
+            )
         if auth is None or auth["id"] <= pre["id"]:
             if auth is None:
                 return _block("DESTRUCTIVE_LIVE", "NO recorded human GO")
@@ -779,13 +854,19 @@ def _claim_gate_verdict_impl(
                 f"(destructive_authorized event {auth['id']} recorded before "
                 f"destructive_preverified event {pre['id']})",
             )
-        return _claim_authorized_gate(conn, scope, auth, ttl=authorized_ttl_seconds, denylist=denylist)
+        return _claim_authorized_gate(
+            conn, scope, auth, ttl=authorized_ttl_seconds, denylist=denylist,
+            go_allowlist=go_allowlist,
+        )
 
     # Legacy-compatible path (require_preverify=False).
     if auth is not None:
         # A canonical event (the operator used approve-destructive) is the
         # source of truth: it must match the current action and not be stale.
-        return _claim_authorized_gate(conn, scope, auth, ttl=authorized_ttl_seconds, denylist=denylist)
+        return _claim_authorized_gate(
+            conn, scope, auth, ttl=authorized_ttl_seconds, denylist=denylist,
+            go_allowlist=go_allowlist,
+        )
     if scope["declared"]:
         # Card declares an action binding; a legacy GO without action_id
         # cannot authorize it — the operator must use the v1.1 flow.
@@ -795,7 +876,10 @@ def _claim_gate_verdict_impl(
             f"destructive_action_id {scope['action_id']!r} but no canonical "
             "destructive_authorized event exists)",
         )
-    go_comments = _human_go_comment_bodies(conn, task_id, assignee=scope["assignee"], denylist=denylist)
+    go_comments = _human_go_comment_bodies(
+        conn, task_id, assignee=scope["assignee"], denylist=denylist,
+        go_allowlist=go_allowlist,
+    )
     valid, mismatched = _partition_go_comments(go_comments, scope["action_id"])
     if mismatched:
         # A v1.1 GO bound to a DIFFERENT action is decisive over any legacy GO
@@ -836,7 +920,8 @@ def _partition_go_comments(go_comments: List[str], action_id: str) -> tuple[list
 
 
 def _claim_authorized_gate(conn, scope: dict, auth: dict, *, ttl: Optional[int],
-                           denylist: Optional[Any] = None) -> Optional[dict]:
+                           denylist: Optional[Any] = None,
+                           go_allowlist: Optional[Any] = None) -> Optional[dict]:
     """Validate an existing canonical authorized event against the card.
 
     Returns ``None`` when the GO is valid for the current action, or a
@@ -862,6 +947,14 @@ def _claim_authorized_gate(conn, scope: dict, auth: dict, *, ttl: Optional[int],
             f"GO recorded by a denied/executor identity (author {author!r}) — "
             "re-record the GO with `hermes kanban approve-destructive`",
         )
+    if not author_allowed_by_allowlist(author, go_allowlist=go_allowlist):
+        return _block(
+            "DESTRUCTIVE_LIVE",
+            "GO author is not in the configured "
+            f"destructive_go_allowlist_authors (author {author!r}) — add "
+            "this operator to the allowlist or re-record the GO with an "
+            "allowlisted author",
+        )
     ttl_seconds = ttl if ttl is not None else DEFAULT_AUTHORIZED_TTL_SECONDS
     stale, why = _is_stale_authorized(conn, scope["task_id"], auth, ttl_seconds=ttl_seconds)
     if stale:
@@ -869,11 +962,102 @@ def _claim_authorized_gate(conn, scope: dict, auth: dict, *, ttl: Optional[int],
     return None
 
 
+def _run_started_at(conn, task_id: str) -> Optional[int]:
+    """Epoch seconds when the task's current (closing) run started, or None.
+
+    The run that executed the destructive action is the one still pointed at
+    by ``tasks.current_run_id`` at completion time (``_end_run`` clears the
+    pointer only after the gate ran inside the same transaction). Read-only.
+    """
+    try:
+        row = conn.execute(
+            "SELECT r.started_at FROM task_runs r "
+            "JOIN tasks t ON t.current_run_id = r.id WHERE t.id = ?",
+            (task_id,),
+        ).fetchone()
+    except Exception:
+        return None
+    return int(row["started_at"]) if row and row["started_at"] else None
+
+
+def _go_precedes_run_start(go_ts: Optional[int], run_started_at: Optional[int]) -> tuple[bool, str]:
+    """HIGH-2 (JCS-160 ex-post closure): a GO is valid for COMPLETION only
+    when it was recorded BEFORE (or at) the start of the run that executed the
+    destructive action.
+
+    Fail-closed: if either timestamp is missing the ordering cannot be
+    determined, so the completion must be blocked with actionable guidance
+    (a missing GO timestamp or run start must never turn into "allow").
+    """
+    if not go_ts or not run_started_at:
+        return False, (
+            "cannot verify GO-before-run ordering: the GO and/or the run "
+            "start timestamp is missing (fail-closed — record the GO before "
+            "the destructive run begins and complete through the claimed run)"
+        )
+    if int(go_ts) > int(run_started_at):
+        return False, (
+            f"GO recorded {int(go_ts) - int(run_started_at)}s AFTER the run "
+            "started (ex-post closure, JCS-160 pattern) — a human GO must "
+            "exist BEFORE the destructive run begins"
+        )
+    return True, ""
+
+
+def _latest_go_comment_timestamp(conn, task_id: str, *, assignee: Optional[str] = None,
+                                 denylist: Optional[Any] = None,
+                                 go_allowlist: Optional[Any] = None,
+                                 valid_bodies: Optional[list] = None) -> Optional[int]:
+    """Latest (max ``created_at``) author-valid human-GO comment timestamp.
+
+    Applies the same author rules as :func:`_human_go_comment_bodies` (empty /
+    denylisted / assignee / un-allowlisted authors never count). When
+    ``valid_bodies`` is given (the ``valid`` partition from
+    :func:`_partition_go_comments`), only those comment bodies are considered.
+    Used by the completion gate to bound a legacy event-less GO against the
+    run start (HIGH-2). Read-only.
+    """
+    denied = {
+        str(a).strip().lower()
+        for a in (denylist if denylist is not None else _AUTHOR_DENYLIST_DEFAULT)
+        if str(a).strip()
+    }
+    try:
+        rows = conn.execute(
+            "SELECT author, body, created_at FROM task_comments "
+            "WHERE task_id = ?",
+            (task_id,),
+        ).fetchall()
+    except Exception:
+        return None
+    best: Optional[int] = None
+    for r in rows:
+        body = (r["body"] or "").strip()
+        if valid_bodies is not None and body not in valid_bodies:
+            continue
+        if not _is_human_go(body, task_id):
+            continue
+        author = (r["author"] or "").strip()
+        if not author:
+            continue
+        if author.lower() in denied:
+            continue
+        if assignee and author.lower() == str(assignee).lower():
+            continue
+        if not author_allowed_by_allowlist(author, go_allowlist=go_allowlist):
+            continue
+        ts = int(r["created_at"] or 0)
+        if ts and (best is None or ts > best):
+            best = ts
+    return best
+
+
 def completion_gate_verdict(
     conn, task_id: str, *, board: Optional[str] = None, strict: bool = False,
     allowlist: Optional[Any] = None, tenant_scope: Any = (),
     require_preverify: bool = False, authorized_ttl_seconds: Optional[int] = None,
     denylist_authors: Optional[Any] = None,
+    go_allowlist_authors: Optional[Any] = None,
 ) -> Optional[dict]:
     """Admission decision for COMPLETING a destructive-live card (fail-closed).
 
@@ -895,6 +1079,7 @@ def completion_gate_verdict(
             require_preverify=require_preverify,
             authorized_ttl_seconds=authorized_ttl_seconds,
             denylist_authors=denylist_authors,
+            go_allowlist_authors=go_allowlist_authors,
         )
     except Exception as exc:
         return {"allowed": False, **_block("DESTRUCTIVE_LIVE", f"destructive gate internal error: {exc}")}
@@ -905,6 +1090,7 @@ def _completion_gate_verdict_impl(
     allowlist: Optional[Any] = None, tenant_scope: Any = (),
     require_preverify: bool = False, authorized_ttl_seconds: Optional[int] = None,
     denylist_authors: Optional[Any] = None,
+    go_allowlist_authors: Optional[Any] = None,
 ) -> Optional[dict]:
     """Implemented body of the completion guard (see the public
     ``completion_gate_verdict`` wrapper for the contract)."""
@@ -916,15 +1102,24 @@ def _completion_gate_verdict_impl(
 
     action_id = scope["action_id"]
     denylist = list(denylist_authors) if denylist_authors else list(_AUTHOR_DENYLIST_DEFAULT)
+    go_allowlist = list(go_allowlist_authors) if go_allowlist_authors else None
     auth = latest_destructive_event(conn, task_id, "destructive_authorized")
+    # HIGH-2 (JCS-160 ex-post closure): the run that executed the destructive
+    # action must have STARTED at-or-after the GO was recorded. A GO registered
+    # after the run start is an ex-post GO and can never complete the card.
+    run_started_at = _run_started_at(conn, task_id)
 
     if auth is None:
         if not require_preverify and not scope["declared"]:
             # Legacy-compat completion: a legacy GO comment (author !=
-            # executor, not denied) suffices when no action binding exists;
-            # a v1.1 GO comment bound to a DIFFERENT action does not (it is
-            # decisive over any coexistent legacy GO — fail-closed).
-            go_comments = _human_go_comment_bodies(conn, task_id, assignee=scope["assignee"], denylist=denylist)
+            # executor, not denied, allowlisted when configured) suffices when
+            # no action binding exists; a v1.1 GO comment bound to a DIFFERENT
+            # action does not (it is decisive over any coexistent legacy GO —
+            # fail-closed).
+            go_comments = _human_go_comment_bodies(
+                conn, task_id, assignee=scope["assignee"], denylist=denylist,
+                go_allowlist=go_allowlist,
+            )
             valid, mismatched = _partition_go_comments(go_comments, scope["action_id"])
             if mismatched:
                 return {
@@ -937,12 +1132,35 @@ def _completion_gate_verdict_impl(
                     ),
                 }
             if valid:
+                go_ts = _latest_go_comment_timestamp(
+                    conn, task_id, assignee=scope["assignee"], denylist=denylist,
+                    go_allowlist=go_allowlist, valid_bodies=valid,
+                )
+                ok, why = _go_precedes_run_start(go_ts, run_started_at)
+                if not ok:
+                    return {
+                        "allowed": False,
+                        **_block(
+                            "DESTRUCTIVE_LIVE",
+                            f"ex-post GO for action ({why})",
+                        ),
+                    }
                 return {"allowed": True, "meta": None}
         return {"allowed": False, **_block("DESTRUCTIVE_LIVE", "no recorded human GO")}
 
-    blocked = _claim_authorized_gate(conn, scope, auth, ttl=authorized_ttl_seconds, denylist=denylist)
+    blocked = _claim_authorized_gate(
+        conn, scope, auth, ttl=authorized_ttl_seconds, denylist=denylist,
+        go_allowlist=go_allowlist,
+    )
     if blocked is not None:
         return {"allowed": False, **blocked}
+
+    ok, why = _go_precedes_run_start(auth.get("created_at"), run_started_at)
+    if not ok:
+        return {
+            "allowed": False,
+            **_block("DESTRUCTIVE_LIVE", f"ex-post GO for action ({why})"),
+        }
 
     post = latest_destructive_event(conn, task_id, "destructive_postcondition_posted")
     if (

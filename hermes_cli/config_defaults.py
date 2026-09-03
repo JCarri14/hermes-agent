@@ -2798,6 +2798,12 @@ DEFAULT_CONFIG = {
             "decomposer",
             "auto-decomposer",
         ],
+        # Operator-controlled positive allowlist for the human-GO author
+        # (v1.2). Empty (default) = no restriction, same behaviour as before.
+        # When non-empty, no human GO / pre-verification author passes the
+        # claim / completion read paths unless listed here (fail-closed on
+        # read; see hermes_cli/destructive_gate.py).
+        "destructive_go_allowlist_authors": [],
         # Automatically claim tasks in the first-class review column and spawn
         # the assigned profile with the bundled sdlc-review skill. Disable for
         # boards where every review is performed manually from the dashboard.

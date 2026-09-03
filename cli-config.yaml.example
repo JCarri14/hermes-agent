@@ -349,6 +349,12 @@ kanban:
     - specifier
     - decomposer
     - auto-decomposer
+  # Operator-controlled positive allowlist for the human-GO author. Empty
+  # (default) = no restriction, same behaviour as before. When non-empty, no
+  # human GO / pre-verification author passes claim/completion unless listed
+  # here (fail-closed on read). Combine with the env-context guard: GO
+  # registration is refused from inside a worker/dispatcher spawn.
+  destructive_go_allowlist_authors: []
 
 # =============================================================================
 # Terminal Tool Configuration

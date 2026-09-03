@@ -708,4 +708,295 @@ def test_completion_verdict_degrades_to_block_on_internal_error(board_home, monk
     assert "internal error" in verdict["reason"]
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# FIX v1.2 — adversarial review findings (t_273c3ca0 → t_8fac751f)
+# HIGH-1 (env-context guard + destructive_go_allowlist_authors),
+# HIGH-2 (completion rejects ex-post GO), WARN-4 (config fail-closed), WARN-5
+# (held-event dedupe).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_worker_env_blocks_go_registration(board_home, monkeypatch, capsys):
+    """HIGH-1 env-context guard: with HERMES_KANBAN_TASK / WORKSPACE / DB
+    present (a real worker/dispatcher spawn), record_destructive_event with an
+    explicit author raises; the CLI commands refuse with rc=1 and actionable
+    output; and a worker-posted GO comment creates NO event (fail-closed)."""
+    import argparse
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", "/tmp/w")
+    # NOTE: deliberately NOT setting HERMES_KANBAN_DB here — that env redirects
+    # kb.connect() to another board DB, which would bypass the fixture's
+    # isolated tmp board (the env-guard fires on any of the three markers;
+    # the per-marker coverage lives in test_worker_env_guard_reason_detects_spawn_env).
+    _set_destructive_config(monkeypatch)
+    from hermes_cli import kanban as kb_cli
+
+    with kb.connect() as conn:
+        _destructive_card(conn, "w1", tenant="CLIENT_A")
+        action_id = _derived_action_id(conn, "w1")
+
+    with kb.connect() as conn:
+        with pytest.raises(kb.DestructiveGateError) as excinfo:
+            kb.record_destructive_event(conn, "w1", "destructive_authorized",
+                                        action_id, author="operator@lab")
+        assert "operator terminal" in str(excinfo.value)
+
+    rc = kb_cli._cmd_preverify_destructive(
+        argparse.Namespace(task_id="w1", action_id=action_id, author="operator@lab"))
+    assert rc == 1
+    rc = kb_cli._cmd_approve_destructive(
+        argparse.Namespace(task_id="w1", action_id=action_id, author="operator@lab",
+                           postcondition=False, evidence=None))
+    assert rc == 1
+
+    # A worker-posted GO comment still writes the comment but never the event.
+    with kb.connect() as conn:
+        cid = kb.add_comment(conn, "w1", "worker-profile",
+                             f"@go destructive w1 {action_id}",
+                             destructive_action_id=action_id)
+    assert cid > 0
+    with kb.connect() as conn:
+        evs = list(conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id='w1' AND kind='destructive_authorized'",
+        ))
+    assert evs == []
+
+
+def test_go_author_allowlist_fail_closed_claim_and_completion(board_home, monkeypatch):
+    """HIGH-1 allowlist: with destructive_go_allowlist_authors configured
+    non-empty, a GO by an unlisted author is rejected at claim AND completion
+    (fail-closed, actionable reason); a listed author passes both."""
+    _set_destructive_config(monkeypatch, destructive_go_allowlist_authors=["operator@lab"])
+    from hermes_cli.destructive_gate import claim_gate_verdict, completion_gate_verdict
+
+    with kb.connect() as conn:
+        _destructive_card(conn, "al1", tenant="CLIENT_A")
+        action_id = _derived_action_id(conn, "al1")
+        kb.record_destructive_event(conn, "al1", "destructive_preverified", action_id,
+                                    author="operator@lab", by="operator@lab")
+        kb.record_destructive_event(conn, "al1", "destructive_authorized", action_id,
+                                    author="bob-not-listed", by="bob-not-listed")
+    with kb.connect_closing() as conn:
+        v = claim_gate_verdict(conn, "al1", go_allowlist_authors=["operator@lab"])
+    assert v is not None
+    assert "allowlist" in v["reason"]
+    with kb.connect_closing() as conn:
+        v = completion_gate_verdict(conn, "al1", go_allowlist_authors=["operator@lab"])
+    assert v is not None and v.get("allowed") is False
+    assert "allowlist" in v["reason"]
+
+    # A listed author passes claim.
+    with kb.connect() as conn:
+        _destructive_card(conn, "al2", tenant="CLIENT_A")
+        action_id = _derived_action_id(conn, "al2")
+        kb.record_destructive_event(conn, "al2", "destructive_authorized", action_id,
+                                    author="operator@lab", by="operator@lab")
+    with kb.connect_closing() as conn:
+        claimed = kb.claim_task(conn, "al2")
+    assert claimed is not None
+
+    # Legacy GO comment authored by an unlisted human is not a GO (fail-closed).
+    with kb.connect() as conn:
+        _destructive_card(conn, "al3", tenant="CLIENT_A")
+        _insert_go(conn, "al3", "@go destructive al3", author="random-person")
+    with kb.connect_closing() as conn:
+        claimed = kb.claim_task(conn, "al3")
+    assert claimed is None
+
+
+def test_go_allowlist_empty_keeps_compat(board_home, monkeypatch):
+    """HIGH-1: destructive_go_allowlist_authors: [] (the default) changes
+    nothing — the legacy GO flow keeps working (no regression)."""
+    _set_destructive_config(monkeypatch, destructive_go_allowlist_authors=[])
+    with kb.connect() as conn:
+        _destructive_card(conn, "al4", tenant="CLIENT_A")
+        _insert_go(conn, "al4", "@go destructive al4", author="human")
+    with kb.connect_closing() as conn:
+        claimed = kb.claim_task(conn, "al4")
+    assert claimed is not None
+    assert claimed.status == "running"
+
+
+def test_completion_blocked_ex_post_go_after_run_start(board_home, monkeypatch):
+    """HIGH-2: a GO registered AFTER the run started never satisfies the
+    completion gate (JCS-160 ex-post closure pattern is rejected and rolled
+    back — the card stays in-flight)."""
+    _set_destructive_config(monkeypatch, destructive_require_preverify=True)
+    with kb.connect() as conn:
+        _destructive_card(conn, "x1", tenant="CLIENT_A")
+        _record_full_sequence(conn, "x1", with_postcondition=True)
+    with kb.connect_closing() as conn:
+        claimed = kb.claim_task(conn, "x1")
+    assert claimed is not None
+    # Re-age the GO event to AFTER the run started (ex-post registration).
+    with kb.connect() as conn:
+        run = conn.execute(
+            "SELECT started_at FROM task_runs WHERE task_id='x1' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        started_at = int(run["started_at"])
+        conn.execute(
+            "UPDATE task_events SET created_at = ? "
+            "WHERE task_id='x1' AND kind='destructive_authorized'",
+            (started_at + 500,),
+        )
+    with kb.connect_closing() as conn:
+        with pytest.raises(kb.DestructiveGateError) as excinfo:
+            kb.complete_task(conn, "x1", result="done")
+    err = str(excinfo.value)
+    assert "ex-post" in err or "AFTER the run" in err
+    with kb.connect() as conn:
+        row = conn.execute("SELECT status FROM tasks WHERE id='x1'").fetchone()
+    assert row["status"] == "running"  # rolled back, still in-flight
+
+
+def test_completion_blocked_ex_post_legacy_go_comment(board_home, monkeypatch):
+    """HIGH-2 legacy-compat: a legacy GO comment recorded after the run started
+    is an ex-post GO and blocks completion."""
+    _set_destructive_config(monkeypatch)  # require_preverify=False, undeclared
+    with kb.connect() as conn:
+        _destructive_card(conn, "x2", tenant="CLIENT_A")
+        _insert_go(conn, "x2", "@go destructive x2", author="human")  # pre-run GO
+    with kb.connect_closing() as conn:
+        claimed = kb.claim_task(conn, "x2")
+    assert claimed is not None
+    # Add a SECOND legacy GO after the run started (ex-post registration).
+    with kb.connect() as conn:
+        run = conn.execute(
+            "SELECT started_at FROM task_runs WHERE task_id='x2' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        after = int(run["started_at"]) + 100
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+            ("x2", "human", "@go destructive x2", after),
+        )
+    with kb.connect_closing() as conn:
+        with pytest.raises(kb.DestructiveGateError) as excinfo:
+            kb.complete_task(conn, "x2", result="done")
+    assert "ex-post" in str(excinfo.value)
+
+
+def test_completion_allowed_legacy_go_before_run_start(board_home, monkeypatch):
+    """HIGH-2: a legacy GO comment recorded before the run started satisfies the
+    ordering — the legacy-compat completion keeps working."""
+    _set_destructive_config(monkeypatch)
+    with kb.connect() as conn:
+        _destructive_card(conn, "x3", tenant="CLIENT_A")
+        _insert_go(conn, "x3", "@go destructive x3", author="human")
+    with kb.connect_closing() as conn:
+        claimed = kb.claim_task(conn, "x3")
+    assert claimed is not None
+    with kb.connect_closing() as conn:
+        ok = kb.complete_task(conn, "x3", result="done")
+    assert ok is True
+    with kb.connect() as conn:
+        row = conn.execute("SELECT status FROM tasks WHERE id='x3'").fetchone()
+    assert row["status"] == "done"
+
+
+def test_completion_blocked_missing_run_timestamp_fail_closed(board_home, monkeypatch):
+    """HIGH-2 fail-closed: completing a destructive-live card with NO run
+    (never claimed) cannot prove GO-before-run ordering -> blocked."""
+    _set_destructive_config(monkeypatch, destructive_require_preverify=True)
+    with kb.connect() as conn:
+        _destructive_card(conn, "x4", tenant="CLIENT_A")
+        _record_full_sequence(conn, "x4", with_postcondition=True)
+    with kb.connect_closing() as conn:
+        with pytest.raises(kb.DestructiveGateError) as excinfo:
+            kb.complete_task(conn, "x4", result="done")
+    err = str(excinfo.value)
+    assert "run" in err and ("ordering" in err or "timestamp" in err)
+    with kb.connect() as conn:
+        row = conn.execute("SELECT status FROM tasks WHERE id='x4'").fetchone()
+    assert row["status"] == "ready"  # rolled back, never claimed
+
+
+def test_completion_blocked_legacy_go_comment_no_timestamp(board_home, monkeypatch):
+    """HIGH-2 fail-closed: a legacy GO comment with a missing/zero timestamp
+    cannot be ordered against the run start -> completion blocked (the claim
+    path has no run-start bound, so the claim may still admit)."""
+    _set_destructive_config(monkeypatch)
+    with kb.connect() as conn:
+        _destructive_card(conn, "x6", tenant="CLIENT_A")
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+            ("x6", "human", "@go destructive x6", 0),
+        )
+    with kb.connect_closing() as conn:
+        claimed = kb.claim_task(conn, "x6")
+    assert claimed is not None
+    with kb.connect_closing() as conn:
+        with pytest.raises(kb.DestructiveGateError) as excinfo:
+            kb.complete_task(conn, "x6", result="done")
+    assert "ordering" in str(excinfo.value) or "timestamp" in str(excinfo.value)
+
+
+def test_policy_config_error_fail_closed(board_home, monkeypatch):
+    """WARN-4: a kanban config resolution error forces the gate ACTIVE with the
+    strictest posture (never a silent SAFE) and blocks a GO-less destructive
+    claim with degraded-mode guidance."""
+    def boom(*a, **k):
+        raise RuntimeError("config exploded")
+    monkeypatch.setattr("hermes_cli.config.load_config", boom)
+    policy = kb._kanban_destructive_policy("default")
+    assert policy["gate_on"] is True
+    assert policy["strict"] is True
+    assert policy["require_preverify"] is True
+    assert policy["config_error"] is not None
+    with kb.connect() as conn:
+        _insert(conn, "c1", title="Cleanup client bucket",
+                body="Delete the R2 bucket erp-client-a-docs.", status="ready")
+    with kb.connect_closing() as conn:
+        claimed = kb.claim_task(conn, "c1")
+    assert claimed is None
+    with kb.connect() as conn:
+        held = list(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id='c1' AND kind='destructive_gate_held'",
+        ))
+    assert len(held) == 1
+    assert "config" in (held[0]["payload"] or "")
+
+
+def test_policy_config_error_admitted_emits_event(board_home, monkeypatch):
+    """WARN-4: even when a full GO chain satisfies the gate, a config
+    resolution error surfaces a destructive_config_error diagnostic event
+    instead of silently trusting degraded config."""
+    def boom(*a, **k):
+        raise RuntimeError("config exploded")
+    monkeypatch.setattr("hermes_cli.config.load_config", boom)
+    with kb.connect() as conn:
+        _destructive_card(conn, "c2", tenant="CLIENT_A")
+        action_id = _derived_action_id(conn, "c2")
+        kb.record_destructive_event(conn, "c2", "destructive_preverified", action_id,
+                                    author="operator@lab", by="operator@lab")
+        kb.add_comment(conn, "c2", "operator@lab", f"@go destructive c2 {action_id}",
+                       destructive_action_id=action_id)
+    with kb.connect_closing() as conn:
+        claimed = kb.claim_task(conn, "c2")
+    assert claimed is not None
+    with kb.connect() as conn:
+        evs = list(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id='c2' AND kind='destructive_config_error'",
+        ))
+    assert len(evs) == 1
+    assert "config" in (evs[0]["payload"] or "")
+
+
+def test_destructive_gate_held_deduped_across_attempts(board_home, monkeypatch):
+    """WARN-5: repeated blocked claims for the same card + gating reason append
+    ONE destructive_gate_held event, not one per attempt (event log is a
+    signal of state changes, not of attempt volume)."""
+    _set_destructive_config(monkeypatch)
+    with kb.connect() as conn:
+        _destructive_card(conn, "dd1", tenant="CLIENT_A")
+    for _ in range(3):
+        with kb.connect_closing() as conn:
+            claimed = kb.claim_task(conn, "dd1")
+        assert claimed is None
+    with kb.connect() as conn:
+        evs = list(conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id='dd1' AND kind='destructive_gate_held'",
+        ))
+    assert len(evs) == 1
+
+
 from pathlib import Path  # noqa: E402  (needed by the board_home fixture)

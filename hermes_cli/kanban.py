@@ -2138,6 +2138,23 @@ def _cmd_claim(args: argparse.Namespace) -> int:
                 f"lock={existing.claim_lock or '(none)'}",
                 file=sys.stderr,
             )
+            # WARN-5: a destructive-gate hold reads as "ready with no lock" —
+            # surface the actionable gate guidance recorded on the card so the
+            # operator knows exactly what to do instead of guessing.
+            held = conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id=? AND kind='destructive_gate_held' "
+                "ORDER BY id DESC LIMIT 1",
+                (args.task_id,),
+            ).fetchone()
+            if held is not None and held["payload"]:
+                try:
+                    held_payload = json.loads(held["payload"])
+                except (TypeError, ValueError):
+                    held_payload = {}
+                guidance = held_payload.get("guidance") or held_payload.get("reason")
+                if guidance:
+                    print(str(guidance), file=sys.stderr)
             return 1
         workspace = kb.resolve_workspace(task)
         kb.set_workspace_path(conn, task.id, str(workspace))
@@ -2192,9 +2209,17 @@ def _resolve_destructive_action_id(conn, task_id: str, requested: Optional[str])
 def _cmd_preverify_destructive(args: argparse.Namespace) -> int:
     """Record the verified pre-check for a destructive-live card (step 1 of
     the canonical sequence: pre-verification -> human GO -> action)."""
-    from hermes_cli.destructive_gate import author_is_denied
+    from hermes_cli.destructive_gate import author_is_denied, worker_env_guard_reason
 
     author = (args.author or _profile_author()).strip()
+    # HIGH-1 env-context guard: this command must run from an operator
+    # terminal. Inside a worker/dispatcher spawn (HERMES_KANBAN_TASK /
+    # WORKSPACE / DB present) recording a pre-verification is a
+    # self-authorization attempt — fail fast before anything is written.
+    env_block = worker_env_guard_reason()
+    if env_block:
+        print(f"kanban: {env_block}", file=sys.stderr)
+        return 1
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, args.task_id)
         if task is None:
@@ -2236,9 +2261,16 @@ def _cmd_approve_destructive(args: argparse.Namespace) -> int:
     transaction, so the event (the source of truth for gated boards) can
     only exist when a human recorded the exact action bound to the card.
     """
-    from hermes_cli.destructive_gate import author_is_denied
+    from hermes_cli.destructive_gate import author_is_denied, worker_env_guard_reason
 
     author = (args.author or _profile_author()).strip()
+    # HIGH-1 env-context guard: a human GO (or a postcondition verification)
+    # must be recorded from an operator terminal, never from inside a
+    # worker/dispatcher spawn — fail fast before anything is written.
+    env_block = worker_env_guard_reason()
+    if env_block:
+        print(f"kanban: {env_block}", file=sys.stderr)
+        return 1
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, args.task_id)
         if task is None:
