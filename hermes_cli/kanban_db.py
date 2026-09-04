@@ -11660,60 +11660,118 @@ def _observation_feed_rows(
 
     Read-only SELECT over ``task_events`` joined to ``tasks`` for
     tenant/assignee/title scoping, limited by the rule's ``window_s`` and the
-    cursor. Returns dict rows with parsed ``payload`` — no writes.
+    cursor. ``kinds`` and ``scope`` (tenants/assignees) are pushed into the
+    SQL WHERE so a strict scope can never starve the top-N (HALLAZGO-1:
+    pre-fix, a kind-only pre-filter + LIMIT could return a page of
+    non-matching rows and hide buried matches entirely). ``payload_contains``
+    is a case-insensitive substring over the serialized payload, so it can
+    only be evaluated Python-side; rows are therefore fetched in bounded
+    pages until the top-N fills or the in-window candidate pool (max
+    ``_CTX_MAX_OBSERVED_EVENTS * 100`` rows per rule) is exhausted.
+
+    Returns dict rows with parsed ``payload`` — no writes.
     """
     from hermes_cli.watch_rules import rule_matches_event
 
     now = int(now or time.time())
     window_cutoff = now - int(rule.window_s)
     kinds = list(rule.kinds) if rule.kinds else None
-
-    q = (
-        "SELECT e.id, e.task_id, e.kind, e.payload, e.created_at, "
-        "       t.tenant AS task_tenant, t.assignee AS task_assignee, t.title AS task_title "
-        "FROM task_events e JOIN tasks t ON t.id = e.task_id "
-        "WHERE e.id > ? AND e.created_at >= ? "
-        + ("AND e.kind IN (" + ",".join("?" * len(kinds)) + ") " if kinds else "")
-        + "ORDER BY e.id DESC LIMIT ?"
-    )
-    params: list = [int(seen_event_id), int(window_cutoff)]
-    if kinds:
-        params.extend(kinds)
-    # Oversample: the SQL kind/scope pre-filter narrows, but payload_contains
-    # still needs Python-side filtering, so fetch up to a generous multiple of
-    # the top-N and slice to the most-recent matches.
-    params.append(_CTX_MAX_OBSERVED_EVENTS * 4)
+    tenants = list(rule.tenants) if rule.tenants else None
+    assignees = list(rule.assignees) if rule.assignees else None
 
     out: list[dict] = []
-    rows = conn.execute(q, params).fetchall()
-    for r in rows:
-        try:
-            payload = json.loads(r["payload"]) if r["payload"] else None
-        except Exception:
-            payload = None
-        if not rule_matches_event(
-            rule,
-            kind=r["kind"],
-            payload=payload,
-            tenant=r["task_tenant"],
-            assignee=r["task_assignee"],
-            now=now,
-        ):
-            continue
-        out.append(
-            {
-                "id": int(r["id"]),
-                "task_id": r["task_id"],
-                "kind": r["kind"],
-                "payload": payload,
-                "created_at": int(r["created_at"]),
-                "tenant": r["task_tenant"],
-                "assignee": r["task_assignee"],
-                "title": r["task_title"] or "",
-            }
+    page_size = _CTX_MAX_OBSERVED_EVENTS
+    # Bounded pagination for payload_contains (the one filter that can only be
+    # evaluated Python-side): walk strictly DOWN the id axis (e.id < last
+    # page's min id) so no row is examined twice, until the top-N fills or the
+    # in-window candidate pool is exhausted. The budget (100 pages × page_size
+    # = 2000 rows per rule) is 25× the pre-fix oversample — enough to reach
+    # matching events buried under a noisy same-kind flood — and if it ever
+    # runs out without filling, a warning logs that matches may exist further
+    # down (fail-open: the feed is advisory, never a blocker).
+    max_pages = 100
+    after_id = None  # strict upper id bound for the next page (None = start at cursor)
+    extra_measure_page = False  # one extra page after an exact top-N fill
+    exhausted = False
+
+    for _ in range(max_pages):
+        where = ["e.id > ?", "e.created_at >= ?"]
+        params: list = [int(seen_event_id), int(window_cutoff)]
+        if kinds:
+            where.append("e.kind IN (" + ",".join("?" * len(kinds)) + ")")
+            params.extend(kinds)
+        if tenants:
+            where.append("t.tenant IN (" + ",".join("?" * len(tenants)) + ")")
+            params.extend(tenants)
+        if assignees:
+            where.append("t.assignee IN (" + ",".join("?" * len(assignees)) + ")")
+            params.extend(assignees)
+        if after_id is not None:
+            where.append("e.id < ?")
+            params.append(after_id)
+        params.append(page_size)
+        q = (
+            "SELECT e.id, e.task_id, e.kind, e.payload, e.created_at, "
+            "       t.tenant AS task_tenant, t.assignee AS task_assignee, t.title AS task_title "
+            "FROM task_events e JOIN tasks t ON t.id = e.task_id "
+            "WHERE " + " AND ".join(where) + " "
+            "ORDER BY e.id DESC LIMIT ?"
         )
-        if len(out) >= _CTX_MAX_OBSERVED_EVENTS:
+        rows = conn.execute(q, params).fetchall()
+        if not rows:
             break
+        after_id = min(int(r["id"]) for r in rows)
+        for r in rows:
+            try:
+                payload = json.loads(r["payload"]) if r["payload"] else None
+            except Exception:
+                payload = None
+            if not rule_matches_event(
+                rule,
+                kind=r["kind"],
+                payload=payload,
+                tenant=r["task_tenant"],
+                assignee=r["task_assignee"],
+                now=now,
+            ):
+                continue
+            out.append(
+                {
+                    "id": int(r["id"]),
+                    "task_id": r["task_id"],
+                    "kind": r["kind"],
+                    "payload": payload,
+                    "created_at": int(r["created_at"]),
+                    "tenant": r["task_tenant"],
+                    "assignee": r["task_assignee"],
+                    "title": r["task_title"] or "",
+                }
+            )
+        if len(out) >= page_size:
+            # Top-N filled: stop — unless we landed exactly ON it at a page
+            # boundary, in which case ONE extra page tells us whether more
+            # matching events exist below (so the "_+N omitted" marker stays
+            # truthful). Crossing mid-page already proves more exist below.
+            if len(out) > page_size or extra_measure_page:
+                break
+            extra_measure_page = True
+    else:
+        # Loop finished without a break: either the budget ran out with
+        # candidates still below, or every page landed exactly on the top-N
+        # with no room to prove "no more exist". Signal it so the caller can
+        # log it (observability) — never a block.
+        exhausted = len(out) <= page_size
+
+    if exhausted:
+        _log.warning(
+            "kanban observation: %s rule %s: pagination budget exhausted "
+            "(%d rows) without proving all matches — matching events may exist "
+            "further down the window; narrow kinds/scope or raise window_s",
+            profile,
+            rule.name,
+            max_pages * page_size,
+        )
+
     return out
 
 

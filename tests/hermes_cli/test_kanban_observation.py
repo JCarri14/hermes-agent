@@ -417,3 +417,108 @@ def test_parse_watch_rules_never_raises():
         rules, warnings = wr.parse_watch_rules(junk)
         assert isinstance(rules, list)
         assert isinstance(warnings, list)
+
+
+# ---------------------------------------------------------------------------
+# Regression — HALLAZGO-1 (QA t_28cd552a): scope/payload filters must never
+# starve the top-N. >80 same-kind events that DON'T match, arriving more
+# recently, must not hide matching events buried below. Pre-fix the SQL
+# pre-filtered only by kind with LIMIT 80, so a full page of non-matching
+# rows came back and the feed was EMPTY (0/6-style repro — violates AC-2).
+# ---------------------------------------------------------------------------
+
+
+def test_regression_scope_match_buried_under_many_nonmatching(kanban_home, conn):
+    _write_watch_yaml(
+        kanban_home,
+        "monitor",
+        (
+            "watch:\n"
+            "  - name: scoped-buried\n"
+            "    match:\n"
+            "      kinds: [blocked]\n"
+            "      scope: {tenants: [acme]}\n"
+        ),
+    )
+    _make_task(conn, task_id="t1", assignee="monitor", tenant="acme")
+    _make_task(conn, task_id="t2", assignee="monitor", tenant="globex")
+    # The matching event is OLDER than the flood: pre-fix the LIMIT 80 page
+    # was filled by the 100 newer globex rows and the feed came back empty.
+    _add_event(conn, "t1", "blocked", payload={"reason": "rotating"})
+    for i in range(100):
+        _add_event(conn, "t2", "blocked", payload={"seq": i})
+
+    feed = kb.build_observation_feed(conn, "monitor", now=_NOW)
+    assert "blocked on t1" in feed  # the buried acme match MUST surface
+    assert "blocked on t2" not in feed  # non-matching tenant never projected
+
+
+def test_regression_payload_match_buried_under_many_nonmatching(kanban_home, conn):
+    _write_watch_yaml(
+        kanban_home,
+        "monitor",
+        (
+            "watch:\n"
+            "  - name: payload-buried\n"
+            "    match:\n"
+            "      kinds: [blocked]\n"
+            "      payload_contains: rotating\n"
+        ),
+    )
+    _make_task(conn, task_id="t1", assignee="monitor")
+    _make_task(conn, task_id="t2", assignee="monitor")
+    # Matching event buried under >80 newer same-kind events WITHOUT the
+    # needle: pre-fix the LIMIT 80 page was entirely non-matching and the
+    # feed came back EMPTY.
+    _add_event(conn, "t1", "blocked", payload={"reason": "rotating lock"})
+    for i in range(100):
+        _add_event(conn, "t2", "blocked", payload={"reason": f"other {i}"})
+
+    feed = kb.build_observation_feed(conn, "monitor", now=_NOW)
+    assert "blocked on t1" in feed  # the buried needle match MUST surface
+    assert "blocked on t2" not in feed
+
+
+def test_regression_buried_match_dedup_after_pagination(kanban_home, conn):
+    _write_watch_yaml(
+        kanban_home,
+        "monitor",
+        (
+            "watch:\n"
+            "  - name: payload-buried\n"
+            "    match:\n"
+            "      kinds: [blocked]\n"
+            "      payload_contains: rotating\n"
+        ),
+    )
+    _make_task(conn, task_id="t1", assignee="monitor")
+    _make_task(conn, task_id="t2", assignee="monitor")
+    _add_event(conn, "t1", "blocked", payload={"reason": "rotating lock"})
+    for i in range(100):
+        _add_event(conn, "t2", "blocked", payload={"reason": f"other {i}"})
+
+    feed1 = kb.build_observation_feed(conn, "monitor", now=_NOW, advance_cursor=True)
+    assert "blocked on t1" in feed1
+    # The cursor advanced to the surfaced match: a second read must NOT
+    # re-project it, even though >80 non-matching rows sit above it (the
+    # pagination walk also stays monotonic — no row examined twice).
+    feed2 = kb.build_observation_feed(conn, "monitor", now=_NOW, advance_cursor=True)
+    assert feed2 == ""
+
+
+def test_regression_flood_still_capped_at_top_n(kanban_home, conn):
+    _write_watch_yaml(
+        kanban_home,
+        "monitor",
+        "watch:\n  - name: flood\n    match: {kinds: [blocked]}\n",
+    )
+    _make_task(conn, task_id="t1", assignee="monitor")
+    for i in range(60):
+        _add_event(conn, "t1", "blocked", payload={"seq": i})
+
+    feed = kb.build_observation_feed(conn, "monitor", now=_NOW)
+    # Only the top-N most recent matching events are projected — caps hold.
+    lines = [ln for ln in feed.splitlines() if ln.startswith("- blocked on t1")]
+    assert 0 < len(lines) <= kb._CTX_MAX_OBSERVED_EVENTS
+    # Feed-level byte cap still applies to the whole block.
+    assert len(feed.encode("utf-8")) <= kb._CTX_MAX_OBSERVATION_BYTES
