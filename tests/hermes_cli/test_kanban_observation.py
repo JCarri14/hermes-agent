@@ -522,3 +522,35 @@ def test_regression_flood_still_capped_at_top_n(kanban_home, conn):
     assert 0 < len(lines) <= kb._CTX_MAX_OBSERVED_EVENTS
     # Feed-level byte cap still applies to the whole block.
     assert len(feed.encode("utf-8")) <= kb._CTX_MAX_OBSERVATION_BYTES
+
+
+@pytest.mark.parametrize(
+    "flood, expected_omitted",
+    [
+        (60, 40),  # 60 total matches, top-20 shown → 40 real omitted
+        (100, 80),  # 100 total matches, top-20 shown → 80 real omitted
+    ],
+)
+def test_regression_flood_marker_counts_real_omitted(kanban_home, conn, flood, expected_omitted):
+    # BI-1: the "_+N omitted" marker must report the REAL number of matching
+    # events beyond the top-N shown. Pre-fix the walk stopped at the first
+    # filled page (+ measure), so omitted was pinned at a fixed
+    # page_size==20 for every flood > 40 (flood=60 → "+20", flood=100 →
+    # "+20"), contradicting the "marker stays truthful" mandate.
+    _write_watch_yaml(
+        kanban_home,
+        "monitor",
+        "watch:\n  - name: flood\n    match: {kinds: [blocked]}\n",
+    )
+    _make_task(conn, task_id="t1", assignee="monitor")
+    for i in range(flood):
+        _add_event(conn, "t1", "blocked", payload={"seq": i})
+
+    feed = kb.build_observation_feed(conn, "monitor", now=_NOW)
+    marker = f"_+{expected_omitted} earlier matching event(s) omitted (top-{kb._CTX_MAX_OBSERVED_EVENTS})_"
+    assert marker in feed
+    # Only the top-N events are actually projected.
+    lines = [ln for ln in feed.splitlines() if ln.startswith("- blocked on t1")]
+    assert 0 < len(lines) <= kb._CTX_MAX_OBSERVED_EVENTS
+    # Feed-level byte cap still applies to the whole block.
+    assert len(feed.encode("utf-8")) <= kb._CTX_MAX_OBSERVATION_BYTES

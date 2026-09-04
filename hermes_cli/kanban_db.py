@@ -11655,7 +11655,7 @@ def _observation_feed_rows(
     *,
     now: Optional[int] = None,
     seen_event_id: int = 0,
-) -> list[dict]:
+) -> tuple[list[dict], int]:
     """Fetch + filter event rows for one watch rule (faceta P4).
 
     Read-only SELECT over ``task_events`` joined to ``tasks`` for
@@ -11666,10 +11666,17 @@ def _observation_feed_rows(
     non-matching rows and hide buried matches entirely). ``payload_contains``
     is a case-insensitive substring over the serialized payload, so it can
     only be evaluated Python-side; rows are therefore fetched in bounded
-    pages until the top-N fills or the in-window candidate pool (max
+    pages until the in-window candidate pool (max
     ``_CTX_MAX_OBSERVED_EVENTS * 100`` rows per rule) is exhausted.
 
-    Returns dict rows with parsed ``payload`` — no writes.
+    Returns ``(rows, total_matches)`` — ``rows`` holds at most the top-N most
+    recent matching events (dict rows with parsed ``payload``, DESC by id);
+    ``total_matches`` is the REAL number of matching events found within the
+    window (bounded by the pagination budget), so the caller can make the
+    ``_+N earlier matching event(s) omitted_`` marker truthful for floods
+    beyond 2×top-N (BI-1: pre-fix, projection stopped right after an exact
+    top-N page and ``omitted`` was pinned at page-size for any larger flood).
+    No writes.
     """
     from hermes_cli.watch_rules import rule_matches_event
 
@@ -11680,18 +11687,22 @@ def _observation_feed_rows(
     assignees = list(rule.assignees) if rule.assignees else None
 
     out: list[dict] = []
+    total_matches = 0
     page_size = _CTX_MAX_OBSERVED_EVENTS
     # Bounded pagination for payload_contains (the one filter that can only be
     # evaluated Python-side): walk strictly DOWN the id axis (e.id < last
-    # page's min id) so no row is examined twice, until the top-N fills or the
-    # in-window candidate pool is exhausted. The budget (100 pages × page_size
+    # page's min id) so no row is examined twice, until the in-window
+    # candidate pool is exhausted. The budget (100 pages × page_size
     # = 2000 rows per rule) is 25× the pre-fix oversample — enough to reach
     # matching events buried under a noisy same-kind flood — and if it ever
-    # runs out without filling, a warning logs that matches may exist further
-    # down (fail-open: the feed is advisory, never a blocker).
+    # runs out without proving the pool empty, a warning logs that matches may
+    # exist further down (fail-open: the feed is advisory, never a blocker).
+    # ``total_matches`` counts EVERY match found while walking, so the
+    # caller's "_+N omitted" marker reports the REAL number of matches beyond
+    # the top-N shown (BI-1: pre-fix, projection stopped at the first filled
+    # page and ``omitted`` was pinned at page-size for any larger flood).
     max_pages = 100
     after_id = None  # strict upper id bound for the next page (None = start at cursor)
-    extra_measure_page = False  # one extra page after an exact top-N fill
     exhausted = False
 
     for _ in range(max_pages):
@@ -11719,6 +11730,7 @@ def _observation_feed_rows(
         )
         rows = conn.execute(q, params).fetchall()
         if not rows:
+            # In-window pool proven empty: total_matches is the exact count.
             break
         after_id = min(int(r["id"]) for r in rows)
         for r in rows:
@@ -11735,32 +11747,26 @@ def _observation_feed_rows(
                 now=now,
             ):
                 continue
-            out.append(
-                {
-                    "id": int(r["id"]),
-                    "task_id": r["task_id"],
-                    "kind": r["kind"],
-                    "payload": payload,
-                    "created_at": int(r["created_at"]),
-                    "tenant": r["task_tenant"],
-                    "assignee": r["task_assignee"],
-                    "title": r["task_title"] or "",
-                }
-            )
-        if len(out) >= page_size:
-            # Top-N filled: stop — unless we landed exactly ON it at a page
-            # boundary, in which case ONE extra page tells us whether more
-            # matching events exist below (so the "_+N omitted" marker stays
-            # truthful). Crossing mid-page already proves more exist below.
-            if len(out) > page_size or extra_measure_page:
-                break
-            extra_measure_page = True
+            total_matches += 1
+            if len(out) < page_size:
+                out.append(
+                    {
+                        "id": int(r["id"]),
+                        "task_id": r["task_id"],
+                        "kind": r["kind"],
+                        "payload": payload,
+                        "created_at": int(r["created_at"]),
+                        "tenant": r["task_tenant"],
+                        "assignee": r["task_assignee"],
+                        "title": r["task_title"] or "",
+                    }
+                )
     else:
-        # Loop finished without a break: either the budget ran out with
-        # candidates still below, or every page landed exactly on the top-N
-        # with no room to prove "no more exist". Signal it so the caller can
-        # log it (observability) — never a block.
-        exhausted = len(out) <= page_size
+        # Loop finished without proving the pool empty: the pagination budget
+        # ran out and matching events may exist further down, so total_matches
+        # is a LOWER BOUND. Signal it so the caller can log it (observability)
+        # — never a block. The marker still shows the real count found.
+        exhausted = True
 
     if exhausted:
         _log.warning(
@@ -11772,7 +11778,7 @@ def _observation_feed_rows(
             max_pages * page_size,
         )
 
-    return out
+    return out, total_matches
 
 
 def build_observation_feed(
@@ -11825,7 +11831,7 @@ def build_observation_feed(
     for rule in rules:
         seen = _read_observation_cursor(conn, profile, rule.name)
         try:
-            rows = _observation_feed_rows(
+            rows, total_matches = _observation_feed_rows(
                 conn, rule, profile, now=now, seen_event_id=seen
             )
         except Exception as exc:
@@ -11843,8 +11849,12 @@ def build_observation_feed(
         max_seen = max((r["id"] for r in rows), default=seen)
 
         shown = rows[:_CTX_MAX_OBSERVED_EVENTS]
-        omitted = len(rows) - len(shown)
-        selected_total += len(rows)
+        # BI-1: omitted counts the REAL number of matching events beyond the
+        # top-N shown (total matches found in the window - shown), not a fixed
+        # page-size value — so the "_+N omitted" marker is truthful for floods
+        # > 2×top-N (e.g. flood=60 → +40, flood=100 → +80).
+        omitted = total_matches - len(shown)
+        selected_total += total_matches
         omitted_total += omitted
         shown_total += len(shown)
 
