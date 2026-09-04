@@ -1731,7 +1731,18 @@ class GatewayKanbanWatchersMixin:
                 try:
                     os.environ["HERMES_KANBAN_BOARD"] = slug
                     try:
-                        triage_ids = _decomp.list_triage_ids()
+                        # ``exclude_loop_triaged`` keeps cards parked in
+                        # triage by ``block_loop_detected`` (re-blocked past
+                        # the recurrence limit) out of the decomposer: those
+                        # are waiting for a HUMAN decision — re-specifying /
+                        # re-promoting them re-dispatches a worker to redo
+                        # already-delivered work (recurring review-required
+                        # respawn loop). ``decompose_task`` refuses them too;
+                        # filtering here also keeps the per-tick budget for
+                        # genuinely fresh triage cards.
+                        triage_ids = _decomp.list_triage_ids(
+                            exclude_loop_triaged=True,
+                        )
                     except Exception as exc:
                         logger.debug(
                             "kanban auto-decompose: list_triage_ids failed on board %s (%s)",

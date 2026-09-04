@@ -289,6 +289,23 @@ def decompose_task(
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
         )
+    if (task.block_recurrences or 0) > 0:
+        # The ONLY path that parks a task in ``triage`` with
+        # ``block_recurrences > 0`` is ``block_loop_detected``: the task
+        # re-blocked for the same cause past BLOCK_RECURRENCE_LIMIT and
+        # was routed to triage for a HUMAN decision (see
+        # ``kanban_db.block_task``). The auto-decomposer must never
+        # re-specify / re-promote such a card — re-specifying discards the
+        # delivered evidence comments and re-dispatches a worker to redo
+        # finished work (the recurring ``review-required`` respawn loop).
+        # Humans exit loop-triaged cards via ``kanban_specify`` /
+        # ``kanban_archive``; ``block_recurrences`` survives both, so a
+        # subsequent same-cause block still re-triages at the limit.
+        return DecomposeOutcome(
+            task_id, False,
+            "task was routed to triage by block_loop_detected "
+            "(awaiting human decision); not auto-decomposed",
+        )
 
     cfg = _load_config()
     orchestrator = _resolve_orchestrator_profile(cfg)
@@ -456,8 +473,19 @@ def decompose_task(
     )
 
 
-def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+def list_triage_ids(
+    *,
+    tenant: Optional[str] = None,
+    exclude_loop_triaged: bool = False,
+) -> list[str]:
+    """Return task ids currently in the triage column.
+
+    ``exclude_loop_triaged=True`` drops tasks that were parked in triage
+    by ``block_loop_detected`` (i.e. ``block_recurrences > 0``): those are
+    awaiting a HUMAN decision and must not be re-specified or re-promoted
+    by the auto-decomposer. Fresh triage cards (``block_recurrences == 0``
+    — the only other way into the column) are kept.
+    """
     with kb.connect_closing() as conn:
         rows = kb.list_tasks(
             conn,
@@ -465,4 +493,6 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
             tenant=tenant,
             limit=1000,
         )
+    if exclude_loop_triaged:
+        rows = [r for r in rows if (r.block_recurrences or 0) == 0]
     return [row.id for row in rows]
