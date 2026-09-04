@@ -481,6 +481,12 @@ _CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
 _CTX_MAX_FIELD_BYTES    = 4 * 1024   # 4 KB per summary/error/metadata/result
 _CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
 _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
+# Observation feed (AGENT_OBSERVATION_CONTRACT_V1): top-N events per rule and
+# a hard cap on the full filtered block, so a busy board can't blow out the
+# worker prompt. Only _CTX_MAX_FIELD_BYTES is reused literally; _CTX_MAX_*
+# prior-attempt/comment values are separate budgets.
+_CTX_MAX_OBSERVED_EVENTS = 20      # most recent N matching events per rule
+_CTX_MAX_OBSERVATION_BYTES = 4 * 1024  # 4 KB cap on the full observed block
 
 
 def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
@@ -1524,6 +1530,19 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+
+-- Observation cursors (AGENT_OBSERVATION_CONTRACT_V1, P2/P4). Per-profile,
+-- per-rule high-water mark of the last event id already surfaced to a
+-- profile's observation feed. Rebuildable cache, NEVER authoritative: if a
+-- row is missing or corrupt the feed falls back to the window (cursor=0).
+-- Deleting a row resets the cursor to the window, re-projecting recent
+-- events — the dedup is an optimization, not a source of truth.
+CREATE TABLE IF NOT EXISTS observation_cursors (
+    profile       TEXT NOT NULL,
+    rule_id       TEXT NOT NULL,
+    seen_event_id INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (profile, rule_id)
+);
 """
 
 
@@ -11566,6 +11585,256 @@ def run_daemon(
 # Worker context builder (what a spawned worker sees)
 # ---------------------------------------------------------------------------
 
+
+def _observation_feature_enabled() -> bool:
+    """Feature flag for the observation feed (AGENT_OBSERVATION_CONTRACT_V1).
+
+    Rollback gate: when disabled, ``build_worker_context`` output is
+    byte-identical to pre-V1 (no observation block is injected). Controlled
+    by config ``kanban.observations.enabled`` (default True) or the env
+    override ``HERMES_KANBAN_OBSERVATIONS`` (0/off/false → disabled).
+    """
+    env = (os.environ.get("HERMES_KANBAN_OBSERVATIONS") or "").strip().lower()
+    if env in ("0", "off", "false", "no", "disabled"):
+        return False
+    if env in ("1", "on", "true", "yes", "enabled"):
+        return True
+    try:
+        from hermes_cli.config import load_config
+
+        return bool((load_config() or {}).get("kanban", {}).get("observations", {}).get("enabled", True))
+    except Exception:
+        return True
+
+
+def _read_observation_cursor(conn: sqlite3.Connection, profile: str, rule_id: str) -> int:
+    """Return the high-water event id already observed for (profile, rule).
+
+    Rebuildable cache: a missing row behaves as cursor=0 (project the window).
+    """
+    row = conn.execute(
+        "SELECT seen_event_id FROM observation_cursors WHERE profile = ? AND rule_id = ?",
+        (profile, rule_id),
+    ).fetchone()
+    if row is None or row["seen_event_id"] is None:
+        return 0
+    try:
+        return int(row["seen_event_id"])
+    except (TypeError, ValueError):
+        return 0
+
+
+def _advance_observation_cursor(
+    conn: sqlite3.Connection, profile: str, rule_id: str, seen_event_id: int
+) -> None:
+    """Persist the observation cursor for (profile, rule) — best-effort cache.
+
+    Never raises: a failure simply means the next read falls back to the
+    window (a corrupt/missing cursor is rebuildable). Monotonic via
+    ``MAX(existing, seen)``.
+    """
+    try:
+        with write_txn(conn, allow_nested=True):
+            conn.execute(
+                "INSERT INTO observation_cursors (profile, rule_id, seen_event_id) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(profile, rule_id) DO UPDATE SET seen_event_id = "
+                "MAX(seen_event_id, excluded.seen_event_id)",
+                (profile, rule_id, int(seen_event_id)),
+            )
+    except Exception as exc:
+        _log.debug(
+            "kanban observation: cursor advance failed for %s/%s (%s)", profile, rule_id, exc
+        )
+
+
+def _observation_feed_rows(
+    conn: sqlite3.Connection,
+    rule,
+    profile: str,
+    *,
+    now: Optional[int] = None,
+    seen_event_id: int = 0,
+) -> list[dict]:
+    """Fetch + filter event rows for one watch rule (faceta P4).
+
+    Read-only SELECT over ``task_events`` joined to ``tasks`` for
+    tenant/assignee/title scoping, limited by the rule's ``window_s`` and the
+    cursor. Returns dict rows with parsed ``payload`` — no writes.
+    """
+    from hermes_cli.watch_rules import rule_matches_event
+
+    now = int(now or time.time())
+    window_cutoff = now - int(rule.window_s)
+    kinds = list(rule.kinds) if rule.kinds else None
+
+    q = (
+        "SELECT e.id, e.task_id, e.kind, e.payload, e.created_at, "
+        "       t.tenant AS task_tenant, t.assignee AS task_assignee, t.title AS task_title "
+        "FROM task_events e JOIN tasks t ON t.id = e.task_id "
+        "WHERE e.id > ? AND e.created_at >= ? "
+        + ("AND e.kind IN (" + ",".join("?" * len(kinds)) + ") " if kinds else "")
+        + "ORDER BY e.id DESC LIMIT ?"
+    )
+    params: list = [int(seen_event_id), int(window_cutoff)]
+    if kinds:
+        params.extend(kinds)
+    # Oversample: the SQL kind/scope pre-filter narrows, but payload_contains
+    # still needs Python-side filtering, so fetch up to a generous multiple of
+    # the top-N and slice to the most-recent matches.
+    params.append(_CTX_MAX_OBSERVED_EVENTS * 4)
+
+    out: list[dict] = []
+    rows = conn.execute(q, params).fetchall()
+    for r in rows:
+        try:
+            payload = json.loads(r["payload"]) if r["payload"] else None
+        except Exception:
+            payload = None
+        if not rule_matches_event(
+            rule,
+            kind=r["kind"],
+            payload=payload,
+            tenant=r["task_tenant"],
+            assignee=r["task_assignee"],
+            now=now,
+        ):
+            continue
+        out.append(
+            {
+                "id": int(r["id"]),
+                "task_id": r["task_id"],
+                "kind": r["kind"],
+                "payload": payload,
+                "created_at": int(r["created_at"]),
+                "tenant": r["task_tenant"],
+                "assignee": r["task_assignee"],
+                "title": r["task_title"] or "",
+            }
+        )
+        if len(out) >= _CTX_MAX_OBSERVED_EVENTS:
+            break
+    return out
+
+
+def build_observation_feed(
+    conn: sqlite3.Connection,
+    profile: Optional[str],
+    task_id: Optional[str] = None,
+    *,
+    now: Optional[int] = None,
+    advance_cursor: bool = False,
+) -> str:
+    """Return the filtered observation block for ``profile`` (faceta P4).
+
+    Projects ``task_events`` matching the profile's declared ``watch`` rules
+    (see ``hermes_cli/watch_rules.py``) into a read-only, context-capped
+    ``## Observable events (watch match)`` block. Pure observation: no
+    routing, no card/worker creation, no event writes.
+
+    Fail-open: any parse/query/load failure logs and returns ``""`` so the
+    caller (``build_worker_context``) proceeds without the block.
+
+    ``advance_cursor=True`` marks the surfaced events as observed (best-effort
+    cache) so a subsequent call does not re-project them.
+    """
+    if not _observation_feature_enabled() or not profile:
+        return ""
+    try:
+        from hermes_cli.watch_rules import load_watch_rules
+
+        rules, warnings = load_watch_rules(profile)
+    except Exception as exc:
+        _log.warning("kanban observation: rules load failed for %s (%s)", profile, exc)
+        return ""
+    if not rules:
+        return ""
+
+    now = int(now or time.time())
+    lines_head = [
+        "## Observable events (watch match)",
+        "_Read-only view of board events matching this profile's watch rules. "
+        "Advisory only — observing does not trigger any execution._",
+    ]
+
+    sections: list[str] = []
+    # Observability: log which kinds/counts were selected/omitted WITHOUT
+    # dumping raw payloads (kinds/counts/top-N only).
+    selected_total = 0
+    omitted_total = 0
+    shown_total = 0
+
+    for rule in rules:
+        seen = _read_observation_cursor(conn, profile, rule.name)
+        try:
+            rows = _observation_feed_rows(
+                conn, rule, profile, now=now, seen_event_id=seen
+            )
+        except Exception as exc:
+            # Fail-open: a query failure logs and omits the block; the caller
+            # (worker context) completes normally.
+            _log.warning(
+                "kanban observation: query failed for %s rule %s (%s)",
+                profile,
+                rule.name,
+                exc,
+            )
+            continue
+        if not rows:
+            continue
+        max_seen = max((r["id"] for r in rows), default=seen)
+
+        shown = rows[:_CTX_MAX_OBSERVED_EVENTS]
+        omitted = len(rows) - len(shown)
+        selected_total += len(rows)
+        omitted_total += omitted
+        shown_total += len(shown)
+
+        lines = [f"### rule `{rule.name}` (kinds={rule.kinds_label}, window {rule.window_s}s)"]
+        for r in shown:
+            age = _relative_age(r["created_at"], now)
+            title = (r["title"] or "").strip().splitlines()
+            title_snip = (title[0][:_CTX_MAX_FIELD_BYTES] if title else "(no title)")
+            scope = []
+            if r["tenant"]:
+                scope.append(f"tenant {r['tenant']}")
+            if r["assignee"]:
+                scope.append(f"assignee {r['assignee']}")
+            scope_str = f" ({', '.join(scope)})" if scope else ""
+            lines.append(f"- {r['kind']} on {r['task_id']} {age}: {title_snip}{scope_str}")
+        if omitted:
+            lines.append(f"_+{omitted} earlier matching event(s) omitted (top-{_CTX_MAX_OBSERVED_EVENTS})_")
+        sections.append("\n".join(lines))
+
+        if advance_cursor and max_seen > seen:
+            _advance_observation_cursor(conn, profile, rule.name, max_seen)
+
+    if not sections:
+        _log.info(
+            "kanban observation: profile=%s rules=%d shown=0 (no matching events in window)",
+            profile,
+            len(rules),
+        )
+        return ""
+
+    block = "\n".join(lines_head + [""] + sections)
+    # Hard cap on the full block so it can never dominate the worker prompt.
+    if len(block) > _CTX_MAX_OBSERVATION_BYTES:
+        block = block[:_CTX_MAX_OBSERVATION_BYTES] + "\n…[observation block truncated]"
+    for w in warnings:
+        _log.warning("kanban observation: %s (%s)", w, profile)
+
+    _log.info(
+        "kanban observation: profile=%s rules=%d selected=%d shown=%d omitted=%d",
+        profile,
+        len(rules),
+        selected_total,
+        shown_total,
+        omitted_total,
+    )
+    return block + "\n"
+
+
 def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     """Return the full text a worker should read to understand its task.
 
@@ -11810,6 +12079,29 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             lines.append(f"comment from worker `{safe_author}` at {ts_disp}:")
             lines.append(_cap(c.body, _CTX_MAX_COMMENT_BYTES))
             lines.append("")
+
+    # Observation feed (AGENT_OBSERVATION_CONTRACT_V1, P2+P4): inject a
+    # filtered, read-only projection of board events matching this profile's
+    # watch rules. Purely advisory and fail-open: any failure logs and omits
+    # the block — the worker completes exactly as before observation existed.
+    if task.assignee:
+        try:
+            obs_block = build_observation_feed(
+                conn,
+                task.assignee,
+                task_id,
+                now=_now,
+                advance_cursor=True,
+            )
+            if obs_block:
+                lines.append(obs_block)
+        except Exception as exc:
+            _log.warning(
+                "kanban observation: feed omitted for %s/profile %s (%s)",
+                task_id,
+                task.assignee,
+                exc,
+            )
 
     return "\n".join(lines).rstrip() + "\n"
 
