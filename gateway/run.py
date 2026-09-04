@@ -13581,6 +13581,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 continue
 
+            # Single-consumer profile routing: a secondary (non-active) profile
+            # that cannot actually serve a platform (no effective credential for
+            # it) must NOT raise a Slack consumer. It stays routable as an
+            # execution profile via profile_routes, but the TRANSPORT owner is
+            # the active profile (the one holding the credential). This is what
+            # lets ONE SLACK CREDENTIAL -> ONE CONSUMER -> profile_routes ->
+            # DIFFERENT EXECUTION PROFILE work without a per-profile consumer.
+            if (
+                profile_name != self._active_profile_name()
+                and GatewayRunner._adapter_credential_fingerprint(adapter) is None
+            ):
+                logger.info(
+                    "[MULTIPLEX] Profile '%s': platform '%s' has no effective "
+                    "credential — skipping as a consumer (routable execution "
+                    "profile only, transport owned by active profile)",
+                    profile_name,
+                    platform.value,
+                )
+                continue
+
             # Same-token conflict detection — refuse a duplicate poll.
             credential_claim = self._adapter_credential_claim(platform, adapter)
             if credential_claim is not None:
