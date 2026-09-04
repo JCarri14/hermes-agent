@@ -161,3 +161,87 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert "not in triage" in outcome.reason
 
 
+def _park_in_triage_via_block_loop(kanban_home, *, recurrences: int = 3):
+    """Create a triage card and stamp it the way ``block_loop_detected`` does
+    (status='triage' + block_recurrences > 0) — the ONLY path that raises
+    block_recurrences while a task sits in triage."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="loop card", triage=True)
+        conn.execute(
+            "UPDATE tasks SET block_kind=?, block_recurrences=? WHERE id=?",
+            ("needs_input", recurrences, tid),
+        )
+    return tid
+
+
+def test_decompose_refuses_loop_triaged_without_touching_llm(kanban_home):
+    tid = _park_in_triage_via_block_loop(kanban_home)
+
+    patches = _patch_list_profiles(["orchestrator"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client("unused") as llm, _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="auto-decomposer")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    assert "block_loop_detected" in outcome.reason
+    # The guard fires before the auxiliary LLM is even invoked — the card is
+    # awaiting a human decision, not a fresh spec.
+    assert llm.mock_calls == []
+    # Card stays parked in triage; it must NOT be re-specified / re-promoted.
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.status == "triage"
+    assert task.block_recurrences == 3
+
+
+def test_decompose_fresh_triage_still_runs_composer(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ship a feature", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": False,
+        "rationale": "single unit",
+        "title": "Tightened",
+        "body": "Spec.",
+    })
+    patches = _patch_list_profiles(["orchestrator", "fallback"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload) as llm, _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert llm.mock_calls  # fresh triage still reaches the decomposer LLM
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    # Single-task promotion: triage -> todo -> ready (recompute_ready runs on
+    # the parent-free card right after specify).
+    assert task.status == "ready"
+
+
+def test_list_triage_ids_excludes_loop_triaged_only_when_requested(kanban_home):
+    # Fresh triage card (block_recurrences stays 0).
+    with kb.connect() as conn:
+        fresh = kb.create_task(conn, title="fresh idea", triage=True)
+    looped = _park_in_triage_via_block_loop(kanban_home)
+
+    assert fresh != looped
+    all_ids = decomp.list_triage_ids()
+    assert fresh in all_ids and looped in all_ids
+
+    fresh_only = decomp.list_triage_ids(exclude_loop_triaged=True)
+    assert fresh in fresh_only
+    assert looped not in fresh_only
+
+
