@@ -366,6 +366,13 @@ def _fire_dispatch_tick_hook(
 # long single-call MCP workflows.
 DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
 
+# Default staleness window for a canonical `destructive_authorized` event
+# (human GO). A GO older than this no longer admits the claim/completion of
+# a destructive-live card; operators re-record it via
+# `hermes kanban approve-destructive`. Mirrors
+# ``hermes_cli.destructive_gate.DEFAULT_AUTHORIZED_TTL_SECONDS``.
+DEFAULT_AUTHORIZED_TTL_SECONDS = 7 * 24 * 60 * 60
+
 # If a worker's PID is still alive but its ``last_heartbeat_at`` is
 # older than this when ``release_stale_claims`` runs, treat the worker
 # as wedged and reclaim regardless of PID liveness (#29747 gap 3).
@@ -4010,7 +4017,8 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # ---------------------------------------------------------------------------
 
 def add_comment(
-    conn: sqlite3.Connection, task_id: str, author: str, body: str
+    conn: sqlite3.Connection, task_id: str, author: str, body: str,
+    *, destructive_action_id: Optional[str] = None,
 ) -> int:
     if not body or not body.strip():
         raise ValueError("comment body is required")
@@ -4029,8 +4037,80 @@ def add_comment(
             "VALUES (?, ?, ?, ?)",
             (task_id, author.strip(), body.strip(), now),
         )
+        comment_id = int(cur.lastrowid or 0)
         _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
-        return int(cur.lastrowid or 0)
+        # v1.1 deterministic human-GO: when the comment body is the canonical
+        # GO line WITH an action_id and the author passes the denylist /
+        # executor checks, record the `destructive_authorized` event in the
+        # SAME transaction as the comment (the event is the source of truth
+        # for gated boards). Never fails the comment insert — on any
+        # inconsistency the event is simply not created and the gate blocks
+        # closed with actionable guidance.
+        try:
+            _maybe_record_authorized_event(
+                conn, task_id, author, body, comment_id,
+                destructive_action_id=destructive_action_id,
+            )
+        except Exception:
+            pass
+        return comment_id
+
+
+def _maybe_record_authorized_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    author: str,
+    body: str,
+    comment_id: int,
+    *,
+    destructive_action_id: Optional[str] = None,
+) -> None:
+    """Record ``destructive_authorized`` when ``body`` is a consistent v1.1 GO.
+
+    Consistency requirements (all of them, else NO event — fail-closed):
+      * ``body`` contains a GO line for THIS task with an action_id (the
+        legacy form without action_id never produces an event);
+      * the GO line's action_id equals ``destructive_action_id`` when the
+        caller supplied it, otherwise the card's current action_id
+        (declared or derived);
+      * the author is a human: not in the denylist and not the assignee.
+    """
+    from hermes_cli.destructive_gate import (
+        GO_LINE_RE,
+        author_is_denied,
+        compute_destructive_action_id,
+    )
+
+    m = GO_LINE_RE.search(body or "")
+    if not m or m.group(1) != task_id:
+        return
+    action_id = m.group(2)
+    if not action_id:
+        return  # legacy GO without action binding: no event (see policy v1.1)
+    expected = (destructive_action_id or "").strip()
+    if not expected:
+        row = conn.execute(
+            "SELECT title, body, tenant, assignee FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return
+        expected = compute_destructive_action_id(
+            row["title"] or "", row["body"] or "",
+            tenant=row["tenant"] or None, assignee=row["assignee"] or None,
+        )
+    if action_id != expected:
+        return  # GO binds a different action -> no event; the gate blocks
+    assignee_row = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    assignee = assignee_row["assignee"] if assignee_row else None
+    if author_is_denied(author, assignee=assignee):
+        return  # executor / dashboard / system author -> no event
+    record_destructive_event(
+        conn, task_id, "destructive_authorized", action_id,
+        author=author, comment_id=comment_id,
+    )
 
 
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
@@ -4351,6 +4431,81 @@ def _append_event(
     )
 
 
+def record_destructive_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    kind: str,
+    action_id: str,
+    *,
+    author: Optional[str] = None,
+    comment_id: Optional[int] = None,
+    verb: Optional[str] = None,
+    resource: Optional[str] = None,
+    evidence: Optional[str] = None,
+    by: Optional[str] = None,
+) -> Optional[int]:
+    """Record a deterministic human-GO event (``destructive_*`` kinds).
+
+    Idempotent: the same ``(task_id, kind, action_id)`` never inserts twice —
+    a repeat approval/pre-verification for the SAME action is a no-op that
+    returns the existing event id (the payload of the first record is kept).
+
+    Caller manages the transaction: either inside an open ``write_txn``
+    (e.g. ``add_comment`` composes the ``destructive_authorized`` event with
+    the comment insert) or on an autocommit connection (``isolation_level``
+    is None for kanban connections, so a bare insert persists immediately).
+
+    Returns the event row id (new or existing).
+    """
+    from hermes_cli.destructive_gate import (
+        DESTRUCTIVE_EVENT_KINDS,
+        worker_env_guard_reason,
+    )
+
+    if kind not in DESTRUCTIVE_EVENT_KINDS:
+        raise ValueError(f"unknown destructive event kind: {kind!r}")
+    # HIGH-1 env-context guard: a GO / pre-verification / postcondition must be
+    # recorded from an operator terminal, never from inside a worker/dispatcher
+    # spawn (the dispatcher injects HERMES_KANBAN_TASK / WORKSPACE / DB into
+    # every worker it spawns; an interactive operator terminal has none). An
+    # explicit author paired with a worker env is a self-authorization attempt
+    # — fail-closed with actionable guidance.
+    if (author or by) and worker_env_guard_reason():
+        raise DestructiveGateError(worker_env_guard_reason())
+    action_id = (action_id or "").strip()
+    if not action_id:
+        raise ValueError("action_id is required")
+    existing = conn.execute(
+        "SELECT id FROM task_events "
+        "WHERE task_id = ? AND kind = ? "
+        "AND json_extract(payload, '$.action_id') = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, kind, action_id),
+    ).fetchone()
+    if existing is not None:
+        return int(existing["id"])
+    payload: dict = {"action_id": action_id, "at": int(time.time())}
+    if author:
+        payload["author"] = author
+    if comment_id is not None:
+        payload["comment_id"] = int(comment_id)
+    if verb:
+        payload["verb"] = verb
+    if resource:
+        payload["resource"] = resource
+    if evidence:
+        payload["evidence"] = evidence
+    if by:
+        payload["by"] = by
+    now = int(time.time())
+    cur = conn.execute(
+        "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+        "VALUES (?, NULL, ?, ?, ?)",
+        (task_id, kind, json.dumps(payload, ensure_ascii=False), now),
+    )
+    return int(cur.lastrowid or 0)
+
+
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4666,11 +4821,20 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    destructive_gate: Optional[bool] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
-    already claimed (or is not in ``ready`` status).
+    already claimed (or is not in ``ready`` status), or if the pre-action
+    destructive gate refuses the claim (a destructive-live card without a
+    valid human GO / pre-verification sequence stays ``ready``; a
+    ``destructive_gate_held`` event is recorded).
+
+    ``destructive_gate`` optionally pins the gate: ``True`` forces it on
+    for this claim, ``False`` forces it off, ``None`` (default) resolves
+    the effective policy from config (``kanban.destructive_gate`` /
+    ``kanban.productive_boards``) for the current board.
     """
     now = int(time.time())
     lock = claimer or _claimer_id()
@@ -4701,6 +4865,32 @@ def claim_task(
                 {"reason": "parents_not_done"},
             )
             return None
+        # Pre-action destructive gate (v1.1): the decisive ready->running
+        # funnel. The dispatcher already gates before claim_task (double
+        # check, fail-closed), but a manual `hermes kanban claim`, a
+        # dashboard lane, or any direct call must hit the SAME guard so a
+        # destructive-live card can never start executing without a prior,
+        # valid human GO for its exact action. Blocked claims record a
+        # `destructive_gate_held` event (with actionable guidance) and stay
+        # `ready` — the dispatcher re-evaluates next tick.
+        if destructive_gate is not False:
+            _dg_reason = _destructive_claim_requires_go(
+                conn, task_id, board=get_current_board(), force=destructive_gate,
+            )
+            if _dg_reason is not None:
+                # WARN-5: deduplicated by (card, gating reason) — repeated
+                # blocked attempts from the dispatcher ticks or multiple claim
+                # surfaces must not spam the event log with identical rows.
+                _append_diagnostic_dedup(
+                    conn, task_id, "destructive_gate_held",
+                    {
+                        "class": "DESTRUCTIVE_LIVE",
+                        "reason": _dg_reason.splitlines()[0] if _dg_reason else "destructive gate blocked",
+                        "guidance": _dg_reason,
+                        "at_claim": True,
+                    },
+                )
+                return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
         # it when the CAS resets the pointer below. No-op when the invariant
@@ -5406,6 +5596,18 @@ class CompletionPersistenceError(RuntimeError):
     """
 
 
+class DestructiveGateError(RuntimeError):
+    """Raised when completing a destructive-live card fails the human-GO gate.
+
+    Fail-closed pre-action gate: ``pre-verification -> human GO ->
+    destructive action -> postcondition verification``. Runs inside the
+    completion write transaction, before ``_verify_completion_persistence``,
+    so a rejection rolls back the status transition (the card stays in-flight
+    with its workspace preserved) and the error message tells the operator
+    exactly how to record the missing GO / postcondition.
+    """
+
+
 def _declared_completion_artifacts(metadata: Optional[dict]) -> list[str]:
     """Return the non-empty string artifact paths declared in ``metadata``."""
     if not isinstance(metadata, dict):
@@ -5723,6 +5925,7 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
+    destructive_gate: Optional[bool] = None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
@@ -5859,6 +6062,26 @@ def complete_task(
         # task stays in-flight with its workspace preserved for bounded recovery.
         # ``EXECUTOR_FINISHED != DELIVERABLE_PERSISTED`` — a CLAIMED deliverable
         # must be verified persistent before DONE.
+        #
+        # Pre-action destructive gate (v1.1): for destructive-live cards the
+        # human-GO chain (pre-verification -> human GO -> postcondition
+        # verification) must be complete BEFORE the card closes. Raises
+        # DestructiveGateError (rolls back the whole transaction; the card
+        # stays in-flight) when the canonical GO or the postcondition
+        # verification is missing. `destructive_gate=False` pins the gate off
+        # for this completion.
+        if destructive_gate is not False:
+            _dg_meta = _destructive_completion_verified(
+                conn, task_id, board=get_current_board(), force=destructive_gate,
+            )
+            if _dg_meta and isinstance(metadata, dict):
+                # Traceability on the closing run's metadata: which GO and
+                # which postcondition event admitted this completion. The
+                # gate is authoritative — it overwrites any worker-supplied
+                # value with the verified ids.
+                for k in ("approved_action_id", "authorized_event_id", "postverified_event_id"):
+                    if _dg_meta.get(k) is not None:
+                        metadata[k] = _dg_meta[k]
         _verify_completion_persistence(conn, task_id, metadata=metadata)
         run_id = _end_run(
             conn, task_id,
@@ -10348,6 +10571,210 @@ def _destructive_gate_requires_go(conn, task_id, *, board=None, strict: bool = F
         return ("DESTRUCTIVE_LIVE", f"destructive_gate evaluate error: {exc}")
 
 
+def _kanban_destructive_policy(board: Optional[str] = None, *, force: Optional[bool] = None) -> dict:
+    """Resolve the effective destructive-gate policy for the current board.
+
+    ``force`` (optional) pins the gate on/off for callers that must bypass
+    config (tests, explicit CLI flags): ``True`` -> on, ``False`` -> off,
+    ``None`` (default) -> resolve from ``kanban.*`` config:
+      * gate ON when ``kanban.destructive_gate`` is true, or the board is in
+        ``kanban.productive_boards`` (which also forces strict classification
+        and requires pre-verification);
+      * ``require_preverify`` defaults to False outside productive boards;
+      * ``authorized_ttl_seconds`` defaults to 7 days;
+      * ``denylist`` defaults to ``destructive_go_denylist_authors`` (or the
+        module default when unset);
+      * ``go_allowlist`` defaults to ``destructive_go_allowlist_authors``
+        (empty = no operator allowlist restriction; non-empty = the human-GO
+        author must be listed, fail-closed on read).
+
+    Fail-closed (WARN-4): a config load error must NEVER silently disable the
+    gate. ``load_config`` normally honours defaults for an absent file, so
+    reaching the exception branch means real breakage — the gate is forced ON
+    with the strictest posture (pre-verification required, strict
+    classification) and ``config_error`` is returned so callers can surface an
+    event/guidance. ``force=False`` remains an explicit opt-out for callers
+    that pin the gate off on purpose (tests, ``--no-gate``-style flags).
+    """
+    base: dict = {}
+    config_error: Optional[str] = None
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        kc = cfg.get("kanban") or {}
+        if isinstance(kc, dict):
+            base = kc
+        else:
+            config_error = "kanban config section is not a mapping"
+    except Exception as exc:
+        config_error = f"kanban config load failed: {exc}"
+    productive = base.get("productive_boards") or []
+    if not isinstance(productive, list):
+        productive = []
+    b = (board or "").strip() or get_current_board()
+    is_productive = b in productive
+    if force is True:
+        gate_on = True
+    elif force is False:
+        gate_on = False
+    else:
+        # WARN-4: on a config resolution error the gate is forced ACTIVE (with
+        # the strictest posture below) — a broken config can never silently
+        # disable the pre-action destructive gate.
+        gate_on = bool(base.get("destructive_gate", False)) or is_productive or bool(config_error)
+    tenants = base.get("destructive_tenants") or []
+    if not isinstance(tenants, list):
+        tenants = []
+    denylist = base.get("destructive_go_denylist_authors")
+    if not denylist:
+        try:
+            from hermes_cli.destructive_gate import _AUTHOR_DENYLIST_DEFAULT
+            denylist = list(_AUTHOR_DENYLIST_DEFAULT)
+        except Exception:
+            denylist = ["dashboard", "worker", "hermes-system", "system",
+                        "specifier", "decomposer", "auto-decomposer"]
+    go_allowlist = base.get("destructive_go_allowlist_authors") or []
+    if not isinstance(go_allowlist, list):
+        go_allowlist = []
+    # The gate is deliberately lenient OUTSIDE its explicit activation scope;
+    # productive boards are never lenient about pre-verification. A config
+    # resolution error is never lenient about anything (fail-closed).
+    require_preverify = bool(base.get("destructive_require_preverify", False)) or is_productive or bool(config_error)
+    return {
+        "gate_on": gate_on,
+        "strict": is_productive or bool(config_error),
+        "allowlist": base.get("destructive_allowlist", []) or [],
+        "tenant_scope": tenants,
+        "require_preverify": require_preverify,
+        "ttl": _positive_int(
+            base.get("destructive_authorized_ttl_seconds"),
+            DEFAULT_AUTHORIZED_TTL_SECONDS,
+            minimum=0,
+        ),
+        "denylist": denylist,
+        "go_allowlist": go_allowlist,
+        "config_error": config_error,
+    }
+
+
+def _append_diagnostic_dedup(conn, task_id: str, kind: str, payload: dict) -> bool:
+    """Append a diagnostic event, deduplicated by ``(kind, class, reason)``.
+
+    WARN-5: the dispatcher can evaluate the same held card every tick (and
+    ``claim_task`` can be called from multiple surfaces), which used to append
+    an identical ``destructive_gate_held`` event per attempt. Keeping the
+    latest identical event idempotent (same card + gating reason) makes the
+    event log a signal of state changes, not of tick volume.
+
+    Returns True when a new event was appended, False when the latest event of
+    ``kind`` already carries the same (class, reason) and nothing was written.
+    """
+    first_line = (str(payload.get("reason") or "") or str(payload.get("guidance") or "")).splitlines()[0]
+    try:
+        last = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, kind),
+        ).fetchone()
+    except Exception:
+        last = None
+    if last is not None and last["payload"]:
+        try:
+            prev = json.loads(last["payload"])
+        except (TypeError, ValueError):
+            prev = {}
+        if (
+            prev.get("class") == payload.get("class")
+            and (str(prev.get("reason") or "").splitlines()[0] == first_line)
+        ):
+            return False
+    _append_event(conn, task_id, kind, payload)
+    return True
+
+
+def _destructive_claim_requires_go(
+    conn, task_id: str, *, board: Optional[str] = None, force: Optional[bool] = None,
+) -> Optional[str]:
+    """Centralized pre-action guard for ``claim_task``.
+
+    Returns ``None`` when the claim is admitted; otherwise the full
+    actionable rejection message (the caller records a
+    ``destructive_gate_held`` event and refuses the claim). Always a no-op
+    when the gate is OFF for the board (policy resolution first).
+    """
+    policy = _kanban_destructive_policy(board, force=force)
+    if not policy["gate_on"]:
+        return None
+    from hermes_cli.destructive_gate import claim_gate_verdict
+
+    verdict = claim_gate_verdict(
+        conn, task_id, board=board, strict=policy["strict"],
+        allowlist=policy["allowlist"], tenant_scope=policy["tenant_scope"],
+        require_preverify=policy["require_preverify"],
+        authorized_ttl_seconds=policy["ttl"], denylist_authors=policy["denylist"],
+        go_allowlist_authors=policy["go_allowlist"],
+    )
+    if verdict is None:
+        # Admitted, but if the policy itself could not be resolved (WARN-4)
+        # surface a diagnostic event so operators see the gate ran fail-closed
+        # on degraded config instead of silently trusting half-loaded values.
+        if policy.get("config_error"):
+            _append_diagnostic_dedup(
+                conn, task_id, "destructive_config_error",
+                {
+                    "class": "DESTRUCTIVE_LIVE",
+                    "reason": f"config resolution error — gate ran in strict "
+                              f"fail-closed mode: {policy['config_error']}",
+                },
+            )
+        return None
+    msg = verdict.get("guidance") or verdict.get("reason") or "destructive gate blocked"
+    if policy.get("config_error"):
+        msg = (
+            f"destructive gate degraded to fail-closed strict mode because "
+            f"kanban config failed to resolve ({policy['config_error']})\n{msg}"
+        )
+    return msg
+
+
+def _destructive_completion_verified(
+    conn, task_id: str, *, board: Optional[str] = None, force: Optional[bool] = None,
+) -> Optional[dict]:
+    """Fail-closed completion guard for destructive-live cards.
+
+    Returns the tracing metadata dict
+    ``{"approved_action_id", "authorized_event_id", "postverified_event_id"}``
+    when the card may close, ``None`` when the gate is OFF / the card is not
+    destructive-live in scope, and raises :class:`DestructiveGateError` with
+    actionable guidance when the human-GO / postcondition chain is not
+    satisfied.
+    """
+    policy = _kanban_destructive_policy(board, force=force)
+    if not policy["gate_on"]:
+        return None
+    from hermes_cli.destructive_gate import completion_gate_verdict
+
+    verdict = completion_gate_verdict(
+        conn, task_id, board=board, strict=policy["strict"],
+        allowlist=policy["allowlist"], tenant_scope=policy["tenant_scope"],
+        require_preverify=policy["require_preverify"],
+        authorized_ttl_seconds=policy["ttl"], denylist_authors=policy["denylist"],
+        go_allowlist_authors=policy["go_allowlist"],
+    )
+    if verdict is None or verdict.get("allowed"):
+        meta = verdict.get("meta") if verdict else None
+        return meta if isinstance(meta, dict) else None
+    guidance = verdict.get("guidance") or verdict.get("reason") or "destructive gate blocked"
+    if policy.get("config_error"):
+        guidance = (
+            f"destructive gate degraded to fail-closed strict mode because "
+            f"kanban config failed to resolve ({policy['config_error']})\n"
+            + guidance
+        )
+    raise DestructiveGateError(guidance)
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -10790,13 +11217,19 @@ def _dispatch_once_locked(
             if _dg is not None:
                 cls_, reason = _dg
                 result.skipped_destructive_gate.append((row["id"], cls_))
-                # Emit a diagnostic event so operators can see why the card
-                # stayed ready without guessing. Never mutates claim state.
+                # Diagnostic event so operators can see why the card
+                # stayed ready without guessing (WARN-5: deduplicated by
+                # card + gating reason across ticks). Never mutates claim
+                # state.
                 if not dry_run:
                     with write_txn(conn):
-                        _append_event(
+                        _append_diagnostic_dedup(
                             conn, row["id"], "destructive_gate_held",
-                            {"class": cls_, "reason": reason},
+                            {
+                                "class": cls_,
+                                "reason": (reason or "destructive gate blocked").splitlines()[0],
+                                "guidance": reason or "destructive gate blocked",
+                            },
                         )
                 continue
         if dry_run:
