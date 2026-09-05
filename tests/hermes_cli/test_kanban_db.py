@@ -1995,3 +1995,80 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Deterministic human-GO events (v1.1 destructive gate)
+# ---------------------------------------------------------------------------
+
+
+def _seed_task(conn, tid, *, title="Delete the R2 bucket erp-client-a-docs."):
+    conn.execute(
+        "INSERT INTO tasks (id, title, body, assignee, status, created_at, "
+        "workspace_kind) VALUES (?,?,?,?,?,?, 'scratch')",
+        (tid, title, "Delete the R2 bucket erp-client-a-docs.", "dev", "ready",
+         int(time.time())),
+    )
+
+
+def test_record_destructive_event_idempotent(kanban_home):
+    """Same (task_id, kind, action_id) never inserts twice."""
+    with kb.connect() as conn:
+        _seed_task(conn, "t_ev1")
+        first = kb.record_destructive_event(
+            conn, "t_ev1", "destructive_authorized", "sha256:aa",
+            author="operator@lab",
+        )
+        second = kb.record_destructive_event(
+            conn, "t_ev1", "destructive_authorized", "sha256:aa",
+            author="operator@lab",
+        )
+        third = kb.record_destructive_event(
+            conn, "t_ev1", "destructive_authorized", "sha256:aa",
+            author="someone-else",  # a repeat for the SAME action is a no-op
+        )
+    assert first == second == third
+    with kb.connect() as conn:
+        n = conn.execute(
+            "SELECT COUNT(*) AS c FROM task_events "
+            "WHERE task_id='t_ev1' AND kind='destructive_authorized'",
+        ).fetchone()["c"]
+    assert n == 1
+    # A different action_id DOES insert a new event.
+    with kb.connect() as conn:
+        other = kb.record_destructive_event(
+            conn, "t_ev1", "destructive_authorized", "sha256:bb",
+            author="operator@lab",
+        )
+    assert other != first
+
+
+def test_record_destructive_event_rejects_bad_kind(kanban_home):
+    with kb.connect() as conn:
+        _seed_task(conn, "t_ev2")
+        with pytest.raises(ValueError):
+            kb.record_destructive_event(conn, "t_ev2", "not_a_kind", "sha256:aa")
+
+
+def test_latest_event_id_ordering(kanban_home):
+    """latest_destructive_event returns the max-id row per kind, so the
+    gate's ordering rule (id_authorized > id_preverified) is observable."""
+    from hermes_cli.destructive_gate import latest_destructive_event
+
+    with kb.connect() as conn:
+        _seed_task(conn, "t_ev3")
+        kb.record_destructive_event(conn, "t_ev3", "destructive_preverified",
+                                    "sha256:aa", author="operator@lab")
+        kb.record_destructive_event(conn, "t_ev3", "destructive_authorized",
+                                    "sha256:aa", author="operator@lab")
+        kb.record_destructive_event(conn, "t_ev3", "destructive_postcondition_posted",
+                                    "sha256:aa", by="dev", evidence="404")
+    with kb.connect() as conn:
+        pre = latest_destructive_event(conn, "t_ev3", "destructive_preverified")
+        auth = latest_destructive_event(conn, "t_ev3", "destructive_authorized")
+        post = latest_destructive_event(conn, "t_ev3", "destructive_postcondition_posted")
+    assert pre is not None and auth is not None and post is not None
+    assert pre["payload"]["action_id"] == auth["payload"]["action_id"] == "sha256:aa"
+    assert auth["id"] > pre["id"]  # GO recorded after the pre-verification
+    assert post["id"] > auth["id"]  # postcondition recorded after the GO
+    assert latest_destructive_event(conn, "t_ev3", "destructive_authorized")["id"] == auth["id"]

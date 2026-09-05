@@ -572,6 +572,43 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_comment.add_argument("--max-len", type=int, default=None,
                            help="Trim the stored comment body to this many characters")
 
+    # --- deterministic human-GO (destructive gate v1.1) ---
+    p_preverify = sub.add_parser(
+        "preverify-destructive",
+        help="Record a verified pre-check (event destructive_preverified) for a destructive-live card",
+    )
+    p_preverify.add_argument("task_id")
+    p_preverify.add_argument(
+        "action_id", nargs="?", default=None,
+        help="destructive_action_id (default: derived deterministically from the card)",
+    )
+    p_preverify.add_argument(
+        "--author", default=None,
+        help="Operator author (default: $HERMES_PROFILE or 'user')",
+    )
+
+    p_approve = sub.add_parser(
+        "approve-destructive",
+        help="Record the canonical human GO — or, with --postcondition, the post-action verification",
+    )
+    p_approve.add_argument("task_id")
+    p_approve.add_argument(
+        "action_id", nargs="?", default=None,
+        help="destructive_action_id (default: derived deterministically from the card)",
+    )
+    p_approve.add_argument(
+        "--postcondition", action="store_true",
+        help="Record the post-condition verification event instead of the GO",
+    )
+    p_approve.add_argument(
+        "--evidence", default=None,
+        help="Evidence note for --postcondition (e.g. 'post-action read returned HTTP 404')",
+    )
+    p_approve.add_argument(
+        "--author", default=None,
+        help="Operator author (default: $HERMES_PROFILE or 'user')",
+    )
+
     # --- attach / attachments / attach-rm ---
     p_attach = sub.add_parser("attach", help="Attach a local file to a task")
     p_attach.add_argument("task_id")
@@ -1122,6 +1159,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "unlink":   _cmd_unlink,
             "claim":    _cmd_claim,
             "comment":  _cmd_comment,
+            "preverify-destructive": _cmd_preverify_destructive,
+            "approve-destructive": _cmd_approve_destructive,
             "attach":   _cmd_attach,
             "attachments": _cmd_attachments,
             "attach-rm": _cmd_attach_rm,
@@ -1191,6 +1230,8 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "unlink",
     "claim",
     "comment",
+    "preverify-destructive",
+    "approve-destructive",
     "attach",
     "attach-rm",
     "complete",
@@ -2097,6 +2138,23 @@ def _cmd_claim(args: argparse.Namespace) -> int:
                 f"lock={existing.claim_lock or '(none)'}",
                 file=sys.stderr,
             )
+            # WARN-5: a destructive-gate hold reads as "ready with no lock" —
+            # surface the actionable gate guidance recorded on the card so the
+            # operator knows exactly what to do instead of guessing.
+            held = conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id=? AND kind='destructive_gate_held' "
+                "ORDER BY id DESC LIMIT 1",
+                (args.task_id,),
+            ).fetchone()
+            if held is not None and held["payload"]:
+                try:
+                    held_payload = json.loads(held["payload"])
+                except (TypeError, ValueError):
+                    held_payload = {}
+                guidance = held_payload.get("guidance") or held_payload.get("reason")
+                if guidance:
+                    print(str(guidance), file=sys.stderr)
             return 1
         workspace = kb.resolve_workspace(task)
         kb.set_workspace_path(conn, task.id, str(workspace))
@@ -2119,6 +2177,158 @@ def _cmd_comment(args: argparse.Namespace) -> int:
         kb.add_comment(conn, args.task_id, author, body)
     print(f"Comment added to {args.task_id}")
     return 0
+
+
+def _resolve_destructive_action_id(conn, task_id: str, requested: Optional[str]) -> str:
+    """Resolve the card's current action_id; reject a mismatched explicit one.
+
+    The explicit ``action_id`` the operator passes must equal the card's
+    current digest (declared ``destructive_action_id:`` line or derived). A
+    GO must bind to the action actually on the card — never to a stale or
+    invented one.
+    """
+    from hermes_cli.destructive_gate import compute_destructive_action_id
+
+    task = kb.get_task(conn, task_id)
+    if task is None:
+        raise ValueError(f"no such task: {task_id}")
+    expected = compute_destructive_action_id(
+        task.title or "", task.body or "",
+        tenant=task.tenant, assignee=task.assignee,
+    )
+    if requested and requested.strip() != expected:
+        raise ValueError(
+            f"action_id {requested.strip()!r} does not match this card's "
+            f"destructive action (expected {expected!r}) — the GO must bind "
+            "to the action actually on the card. Copy the expected value or "
+            "update the card's `destructive_action_id:` declaration."
+        )
+    return expected
+
+
+def _cmd_preverify_destructive(args: argparse.Namespace) -> int:
+    """Record the verified pre-check for a destructive-live card (step 1 of
+    the canonical sequence: pre-verification -> human GO -> action)."""
+    from hermes_cli.destructive_gate import author_is_denied, worker_env_guard_reason
+
+    author = (args.author or _profile_author()).strip()
+    # HIGH-1 env-context guard: this command must run from an operator
+    # terminal. Inside a worker/dispatcher spawn (HERMES_KANBAN_TASK /
+    # WORKSPACE / DB present) recording a pre-verification is a
+    # self-authorization attempt — fail fast before anything is written.
+    env_block = worker_env_guard_reason()
+    if env_block:
+        print(f"kanban: {env_block}", file=sys.stderr)
+        return 1
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, args.task_id)
+        if task is None:
+            print(f"no such task: {args.task_id}", file=sys.stderr)
+            return 1
+        if author_is_denied(author, assignee=task.assignee):
+            print(
+                f"kanban: author {author!r} cannot record the pre-verification "
+                f"for {args.task_id} — a human operator is required (NOT the "
+                "executor, NOT the dashboard, NOT a system author).\n"
+                "Use --author '<your operator id>' or record it from a human "
+                "session.",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            action_id = _resolve_destructive_action_id(conn, args.task_id, args.action_id)
+        except ValueError as exc:
+            print(f"kanban: {exc}", file=sys.stderr)
+            return 1
+        ev_id = kb.record_destructive_event(
+            conn, args.task_id, "destructive_preverified", action_id,
+            author=author, by=author,
+        )
+    print(f"Pre-verification recorded for {args.task_id} "
+          f"(destructive_action_id={action_id}, event {ev_id}).")
+    print("Next: have a human (NOT the executor, NOT the dashboard) record the GO:")
+    print(f"  hermes kanban approve-destructive {args.task_id} {action_id}")
+    print("The dispatcher then admits the claim on its next tick.")
+    return 0
+
+
+def _cmd_approve_destructive(args: argparse.Namespace) -> int:
+    """Record the canonical human GO (default) or the post-action
+    postcondition verification (``--postcondition``).
+
+    Never self-services: the author must be a human operator (denylist +
+    executor checks) and the GO comment+event are written together in one
+    transaction, so the event (the source of truth for gated boards) can
+    only exist when a human recorded the exact action bound to the card.
+    """
+    from hermes_cli.destructive_gate import author_is_denied, worker_env_guard_reason
+
+    author = (args.author or _profile_author()).strip()
+    # HIGH-1 env-context guard: a human GO (or a postcondition verification)
+    # must be recorded from an operator terminal, never from inside a
+    # worker/dispatcher spawn — fail fast before anything is written.
+    env_block = worker_env_guard_reason()
+    if env_block:
+        print(f"kanban: {env_block}", file=sys.stderr)
+        return 1
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, args.task_id)
+        if task is None:
+            print(f"no such task: {args.task_id}", file=sys.stderr)
+            return 1
+        try:
+            action_id = _resolve_destructive_action_id(conn, args.task_id, args.action_id)
+        except ValueError as exc:
+            print(f"kanban: {exc}", file=sys.stderr)
+            return 1
+        if args.postcondition:
+            # Post-action evidence: recorded by whoever verified the outcome
+            # (typically the executor after the action). The GO must already
+            # exist — a postcondition without a prior GO is meaningless.
+            prev = _latest_destructive_event_kind(conn, args.task_id, "destructive_authorized")
+            if prev is None or prev.get("payload", {}).get("action_id") != action_id:
+                print(
+                    f"kanban: no canonical human GO recorded for {args.task_id} "
+                    f"action {action_id} — record it first with:\n"
+                    f"  hermes kanban approve-destructive {args.task_id} {action_id}",
+                    file=sys.stderr,
+                )
+                return 1
+            ev_id = kb.record_destructive_event(
+                conn, args.task_id, "destructive_postcondition_posted", action_id,
+                by=author, evidence=args.evidence,
+            )
+            print(f"Postcondition verification recorded for {args.task_id} "
+                  f"(destructive_action_id={action_id}, event {ev_id}).")
+            print("The card can now be completed (destructive gate satisfied).")
+            return 0
+        if author_is_denied(author, assignee=task.assignee):
+            print(
+                f"kanban: author {author!r} cannot approve {args.task_id} — the "
+                "GO must come from a human operator (NOT the executor, NOT the "
+                "dashboard, NOT a system author).\n"
+                "Granted GO line format:  @go destructive <task_id> <action_id>",
+                file=sys.stderr,
+            )
+            return 1
+        body = f"@go destructive {args.task_id} {action_id}"
+        cid = kb.add_comment(conn, args.task_id, author, body, destructive_action_id=action_id)
+    print(f"Human GO recorded on {args.task_id} "
+          f"(comment {cid}, destructive_action_id={action_id}).")
+    print("The dispatcher will admit the claim on its next tick.")
+    return 0
+
+
+def _latest_destructive_event_kind(conn, task_id: str, kind: str) -> Optional[dict]:
+    """Read the latest event of a destructive kind (CLI helper, read-only)."""
+    try:
+        from hermes_cli.destructive_gate import latest_destructive_event
+    except Exception:
+        return None
+    try:
+        return latest_destructive_event(conn, task_id, kind)
+    except Exception:
+        return None
 
 
 def _cmd_attach(args: argparse.Namespace) -> int:
