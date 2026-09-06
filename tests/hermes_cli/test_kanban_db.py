@@ -651,6 +651,7 @@ def test_fallback_aware_spawn_claude_uses_wrapper(kanban_home, tmp_path, monkeyp
             conn, title="wrapper route", assignee="alice",
             workspace_kind="dir", workspace_path=str(workspace),
         )
+        # Attempt 1 fails with quota; the fallback queue is recorded.
         kb.claim_task(conn, tid, claimer=f"{host}:openai")
         kb._end_run(conn, tid, outcome="rate_limited", error="quota")
         kb._append_event(
@@ -662,6 +663,10 @@ def test_fallback_aware_spawn_claude_uses_wrapper(kanban_home, tmp_path, monkeyp
             "worker_pid=NULL, current_run_id=NULL WHERE id=?", (tid,),
         )
         conn.commit()
+        # The fallback attempt is claimed (writes the fallback plan into the
+        # run metadata) and then spawned — how the dispatcher actually runs.
+        fallback_claim = kb.claim_task(conn, tid, claimer=f"{host}:claude")
+        assert fallback_claim is not None
         task = kb.get_task(conn, tid)
 
     pid = _kb._fallback_aware_spawn(task, str(workspace), board="default")
@@ -695,12 +700,26 @@ def test_fallback_aware_spawn_lower_uses_hermes_with_override(
     workspace = tmp_path / "ws"
     workspace.mkdir()
     with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
         tid = kb.create_task(
             conn, title="lower route", assignee="alice",
             workspace_kind="dir", workspace_path=str(workspace),
         )
-        kb.claim_task(conn, tid)
+        kb.claim_task(conn, tid, claimer=f"{host}:openai")
         kb._end_run(conn, tid, outcome="rate_limited", error="quota")
+        kb._append_event(
+            conn, tid, "executor_fallback_queued",
+            {"next_executor": "claude-p", "attempt_number": 2, "fallback_from": 1},
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, "
+            "worker_pid=NULL, current_run_id=NULL WHERE id=?", (tid,),
+        )
+        conn.commit()
+        # Claude fails too; the chain advances to the lower fallback, which is
+        # then claimed and spawned.
+        kb.claim_task(conn, tid, claimer=f"{host}:claude")
+        kb._end_run(conn, tid, outcome="rate_limited", error="claude quota")
         kb._append_event(
             conn, tid, "executor_fallback_queued",
             {"next_executor": "hermes-lower-fallback", "attempt_number": 3,
@@ -711,6 +730,7 @@ def test_fallback_aware_spawn_lower_uses_hermes_with_override(
             "worker_pid=NULL, current_run_id=NULL WHERE id=?", (tid,),
         )
         conn.commit()
+        assert kb.claim_task(conn, tid, claimer=f"{host}:lower") is not None
         task = kb.get_task(conn, tid)
 
     pid = _kb._fallback_aware_spawn(task, str(workspace), board="default")
@@ -744,6 +764,56 @@ def test_fallback_aware_spawn_default_without_pending(kanban_home, tmp_path, mon
     pid = _kb._fallback_aware_spawn(task, str(workspace), board="default")
     assert pid == 73333
     assert called["n"] == 1
+
+
+def test_dispatch_once_real_default_spawn_routes_fallback_card_to_wrapper(
+    kanban_home, monkeypatch, tmp_path, all_assignees_spawnable,
+):
+    """REGRESSION (QA finding): with the REAL default spawn (spawn_fn=None),
+    a ready-lane card with a pending claude-p fallback must be spawned through
+    the claude wrapper — NOT through the plain Hermes worker that would retry
+    the same failed OpenAI provider. The previous wiring only patched the
+    review lane, and the e2e test masked this by passing an explicit
+    spawn_fn."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    called: dict = {}
+
+    def _fake_wrapper(task, workspace, *, board=None):
+        called["task"] = task
+        called["workspace"] = workspace
+        return 74444
+
+    monkeypatch.setattr(_kb, "_spawn_claude_fallback_wrapper", _fake_wrapper)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="real-default route", assignee="alice",
+            workspace_kind="dir", workspace_path=str(workspace),
+        )
+        kb.claim_task(conn, tid)
+        kb._end_run(conn, tid, outcome="rate_limited", error="quota")
+        kb._append_event(
+            conn, tid, "executor_fallback_queued",
+            {"next_executor": "claude-p", "attempt_number": 2, "fallback_from": 1},
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, "
+            "worker_pid=NULL, current_run_id=NULL WHERE id=?", (tid,),
+        )
+        conn.commit()
+
+        # THE test: no spawn_fn → real default routing resolution.
+        res = kb.dispatch_once(conn, max_spawn=1)
+
+        assert res.spawned == [(tid, "alice", str(workspace))]
+        assert called.get("task") is not None, (
+            "ready-lane real default spawn must route a pending claude-p fallback "
+            "through _spawn_claude_fallback_wrapper"
+        )
+        assert called["task"].id == tid
 
 
 def test_check_respawn_guard_ignores_workspace_resolution_failure(kanban_home):

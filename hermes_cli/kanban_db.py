@@ -11743,7 +11743,11 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        # Executor-fallback aware default: fallback-queued cards live in the
+        # ready lane and must be spawned through the routing default, else the
+        # claude-p / lower-fallback executors would never actually run (the
+        # plain worker would just retry the failed provider).
+        _spawn = spawn_fn if spawn_fn is not None else _fallback_aware_spawn
         try:
             # Back-compat: older spawn_fn signatures accept only
             # (task, workspace). Test stubs in the suite rely on that.
@@ -12288,37 +12292,43 @@ def _fallback_aware_spawn(
     board: Optional[str] = None,
 ) -> Optional[int]:
     """Dispatcher default spawn: normal cards keep the Hermes worker path;
-    queued executor-fallback attempts route to the right backend.
+    executor-fallback attempts route to the right backend.
 
     * ``claude-p`` -> the claude wrapper (real ``claude -p`` on the same card).
     * ``hermes-lower-fallback`` -> the SAME Hermes worker command but with the
       explicit approved openrouter/deepseek route pinned via ``-m/--provider``
       (never the profile's OpenAI default, never ``fallback_providers``).
+
+    The routing decision reads the CLAIMED run's metadata (written by
+    ``claim_task`` from the pending fallback event). The event itself is
+    consumed by the claim, so reading the event here — *after* the claim —
+    would always see it as consumed and fall back to the plain Hermes worker.
+    The run metadata is the durable plan for THIS attempt.
     """
     try:
-        from dataclasses import replace
-
         with contextlib.closing(connect()) as _conn:
-            pending = _pending_executor_fallback_event(_conn, task.id)
-    except Exception as _exc:
-        pending = None
-        replace = None  # type: ignore[assignment]
-    if pending is None:
+            meta = _run_metadata_by_id(_conn, task.current_run_id)
+    except Exception:
+        meta = {}
+    executor = meta.get("requested_executor") or meta.get("next_executor")
+    if not executor or not meta.get("fallback_from"):
+        # Not a fallback attempt (or metadata unavailable) → plain Hermes path.
         return _default_spawn(task, workspace, board=board)
-    _, payload = pending
-    executor = payload.get("next_executor")
     if executor == _EXECUTOR_CLAUDE_P:
         return _spawn_claude_fallback_wrapper(task, workspace, board=board)
-    if executor == _EXECUTOR_HERMES_LOWER and replace is not None:
-        provider, model = _executor_lower_fallback_route()
-        patched = replace(
-            task,
-            model_override=model,
-            provider_override=provider,
-        )
+    if executor == _EXECUTOR_HERMES_LOWER:
+        # The claim already resolved the approved lower route into the run
+        # metadata; pin the SAME override here so the spawn matches the plan.
+        provider = meta.get("requested_provider") or _DEFAULT_LOWER_FALLBACK_PROVIDER
+        model = meta.get("requested_model") or _DEFAULT_LOWER_FALLBACK_MODEL
+        try:
+            from dataclasses import replace
+            patched = replace(task, model_override=model, provider_override=provider)
+        except Exception:
+            patched = task
         return _default_spawn(patched, workspace, board=board)
-    # Unknown executor tag: fail closed to the normal path; the queued event
-    # stays unconsumed and the guard keeps releasing the card next tick.
+    # Unknown executor tag: fail closed to the normal path; the card will
+    # terminate through the normal failure accounting.
     return _default_spawn(task, workspace, board=board)
 
 
