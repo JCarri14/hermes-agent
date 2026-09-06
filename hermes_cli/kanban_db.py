@@ -459,11 +459,12 @@ def _resolve_crash_grace_seconds() -> int:
 def _resolve_rate_limit_cooldown_seconds() -> int:
     """Return the rate-limit requeue cooldown in seconds.
 
-    Reads ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS`` from the environment;
-    falls back to ``DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS`` when absent, empty,
-    non-integer, or negative. A value of 0 disables the cooldown (re-spawn on
-    the next tick) — useful for tests that want to assert the task becomes
-    spawnable again immediately.
+    Reads ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS`` from the environment
+    (highest precedence), then ``kanban.rate_limit_cooldown_seconds`` from
+    config.yaml, falling back to ``DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS`` when
+    absent, empty, non-integer, or negative. A value of 0 disables the cooldown
+    (re-spawn on the next tick) — useful for tests that want to assert the task
+    becomes spawnable again immediately.
     """
     raw = os.environ.get(
         "HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", ""
@@ -475,7 +476,394 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
             parsed = -1
         if parsed >= 0:
             return parsed
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly() or {}
+        kanban = cfg.get("kanban") if isinstance(cfg, Mapping) else None
+        if isinstance(kanban, Mapping) and "rate_limit_cooldown_seconds" in kanban:
+            parsed = int(kanban["rate_limit_cooldown_seconds"])
+            if parsed >= 0:
+                return parsed
+    except Exception:
+        pass
     return DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+
+
+_EXECUTOR_FALLBACK_EVENT = "executor_fallback_queued"
+_EXECUTOR_FALLBACK_STARTED_EVENT = "executor_fallback_started"
+_EXECUTOR_FALLBACK_STOPPED_EVENT = "executor_fallback_stopped"
+_EXECUTOR_FALLBACK_BLOCKED_EVENT = "executor_fallback_blocked"
+_EXECUTOR_FALLBACK_MAX_ATTEMPTS = 3
+_EXECUTOR_HERMES_PROFILE = "hermes-profile"
+_EXECUTOR_CLAUDE_P = "claude-p"
+_EXECUTOR_HERMES_LOWER = "hermes-lower-fallback"
+_DEFAULT_LOWER_FALLBACK_PROVIDER = "openrouter"
+_DEFAULT_LOWER_FALLBACK_MODEL = "deepseek/deepseek-v4-flash-0731"
+_ENV_FALSE = {"0", "false", "no", "off", "disabled"}
+_ENV_TRUE = {"1", "true", "yes", "on", "enabled"}
+
+
+def _env_bool(name: str) -> Optional[bool]:
+    raw = (os.environ.get(name) or "").strip().lower()
+    if raw in _ENV_FALSE:
+        return False
+    if raw in _ENV_TRUE:
+        return True
+    return None
+
+
+def _executor_fallback_config() -> dict:
+    """Return the small Kanban executor-fallback config block.
+
+    This is intentionally *not* ``fallback_providers``. Native provider
+    fallback remains profile-local and can stay ``[]``; this block only drives
+    dispatcher recovery after a worker has already failed with the EX_TEMPFAIL
+    provider-unavailability sentinel.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly() or {}
+        kanban = cfg.get("kanban") if isinstance(cfg, Mapping) else None
+        block = kanban.get("executor_fallback") if isinstance(kanban, Mapping) else None
+        return dict(block) if isinstance(block, Mapping) else {}
+    except Exception:
+        return {}
+
+
+def _executor_fallback_enabled() -> bool:
+    env = _env_bool("HERMES_KANBAN_EXECUTOR_FALLBACK")
+    if env is not None:
+        return env
+    cfg = _executor_fallback_config()
+    if "enabled" in cfg:
+        return bool(cfg.get("enabled"))
+    return True
+
+
+def _executor_fallback_max_attempts() -> int:
+    raw_env = (os.environ.get("HERMES_KANBAN_EXECUTOR_FALLBACK_MAX_ATTEMPTS") or "").strip()
+    raw = raw_env or str(_executor_fallback_config().get("max_attempts", ""))
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        return _EXECUTOR_FALLBACK_MAX_ATTEMPTS
+    return max(1, min(parsed, _EXECUTOR_FALLBACK_MAX_ATTEMPTS))
+
+
+def _executor_lower_fallback_route() -> tuple[str, str]:
+    cfg = _executor_fallback_config()
+    provider = (
+        os.environ.get("HERMES_KANBAN_EXECUTOR_LOWER_PROVIDER")
+        or cfg.get("lower_provider")
+        or _DEFAULT_LOWER_FALLBACK_PROVIDER
+    )
+    model = (
+        os.environ.get("HERMES_KANBAN_EXECUTOR_LOWER_MODEL")
+        or cfg.get("lower_model")
+        or _DEFAULT_LOWER_FALLBACK_MODEL
+    )
+    return (str(provider).strip(), str(model).strip())
+
+
+def _json_dict(value: Any) -> dict:
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _run_metadata_by_id(conn: sqlite3.Connection, run_id: Optional[int]) -> dict:
+    if not run_id:
+        return {}
+    row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id = ?", (int(run_id),),
+    ).fetchone()
+    return _json_dict(row["metadata"] if row else None)
+
+
+def _next_attempt_number(conn: sqlite3.Connection, task_id: str) -> int:
+    numbers: list[int] = []
+    for row in conn.execute(
+        "SELECT metadata FROM task_runs WHERE task_id = ?", (task_id,),
+    ).fetchall():
+        meta = _json_dict(row["metadata"])
+        try:
+            n = int(meta.get("attempt_number"))
+        except (TypeError, ValueError):
+            continue
+        numbers.append(n)
+    return (max(numbers) + 1) if numbers else 1
+
+
+def _read_profile_model_defaults(profile: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    if not profile:
+        return (None, None)
+    try:
+        from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+        import yaml
+
+        home = Path(resolve_profile_env(normalize_profile_name(profile)))
+        cfg_path = home / "config.yaml"
+        if not cfg_path.exists():
+            return (None, None)
+        data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        model = data.get("model") if isinstance(data, Mapping) else None
+        if isinstance(model, Mapping):
+            return (
+                str(model.get("provider") or "") or None,
+                str(model.get("default") or "") or None,
+            )
+    except Exception:
+        pass
+    return (None, None)
+
+
+def _task_requested_provider_model(
+    task_id: str,
+    profile: Optional[str],
+    model_override: Optional[str],
+    provider_override: Optional[str],
+) -> tuple[Optional[str], Optional[str]]:
+    if model_override or provider_override:
+        provider = provider_override
+        model = model_override
+        if provider is None:
+            provider, _ = _read_profile_model_defaults(profile)
+        return (provider, model)
+    return _read_profile_model_defaults(profile)
+
+
+def _pending_executor_fallback_event(conn: sqlite3.Connection, task_id: str) -> Optional[tuple[int, dict]]:
+    row = conn.execute(
+        "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, _EXECUTOR_FALLBACK_EVENT),
+    ).fetchone()
+    if row is None:
+        return None
+    event_id = int(row["id"])
+    consumed = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'claimed' "
+        "AND id > ? LIMIT 1",
+        (task_id, event_id),
+    ).fetchone()
+    if consumed:
+        return None
+    payload = _json_dict(row["payload"])
+    return (event_id, payload) if payload else None
+
+
+def _has_pending_executor_fallback(conn: sqlite3.Connection, task_id: str) -> bool:
+    return _pending_executor_fallback_event(conn, task_id) is not None
+
+
+def _workspace_handoff_state(workspace_path: Optional[str]) -> tuple[str, dict]:
+    """Classify partial state before handing a card to another executor.
+
+    The classifier is deliberately conservative but bounded. Git workspaces get
+    an exact porcelain snapshot. Empty non-git scratch dirs are no-mutation;
+    non-empty non-git dirs are unknown and fail closed elsewhere.
+    """
+    if not workspace_path:
+        return ("NO_MUTATION", {"reason": "no_workspace_path"})
+    path = Path(workspace_path)
+    if not path.exists():
+        return ("NO_MUTATION", {"workspace": str(path), "reason": "workspace_missing"})
+    if path.is_file():
+        return ("UNKNOWN_PARTIAL_STATE", {"workspace": str(path), "reason": "workspace_is_file"})
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(path), "status", "--porcelain=v1", "--untracked-files=all"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            check=False,
+        )
+        if proc.returncode == 0:
+            status = (proc.stdout or "").strip()
+            if not status:
+                return ("NO_MUTATION", {"workspace": str(path), "vcs": "git"})
+            return (
+                "SAFE_PARTIAL_STATE",
+                {"workspace": str(path), "vcs": "git", "dirty_status": status[:2000]},
+            )
+    except Exception as exc:
+        return ("UNKNOWN_PARTIAL_STATE", {"workspace": str(path), "error": str(exc)[:300]})
+    try:
+        entries = [p for p in path.iterdir() if p.name not in {".git", ".hg", ".svn"}]
+    except Exception as exc:
+        return ("UNKNOWN_PARTIAL_STATE", {"workspace": str(path), "error": str(exc)[:300]})
+    if not entries:
+        return ("NO_MUTATION", {"workspace": str(path), "vcs": "none"})
+    return (
+        "UNKNOWN_PARTIAL_STATE",
+        {"workspace": str(path), "reason": "non_git_workspace_has_files"},
+    )
+
+
+def _base_attempt_metadata(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    profile: Optional[str],
+    model_override: Optional[str],
+    provider_override: Optional[str],
+) -> dict:
+    pending = _pending_executor_fallback_event(conn, task_id)
+    if pending is not None:
+        _, payload = pending
+        meta = dict(payload)
+        meta.setdefault("attempt_number", _next_attempt_number(conn, task_id))
+        meta.setdefault("requested_executor", meta.get("next_executor"))
+        meta.setdefault("actual_executor", meta.get("next_executor"))
+        meta.setdefault("profile", profile)
+        return meta
+    provider, model = _task_requested_provider_model(
+        task_id, profile, model_override, provider_override,
+    )
+    return {
+        "attempt_number": _next_attempt_number(conn, task_id),
+        "profile": profile,
+        "requested_executor": _EXECUTOR_HERMES_PROFILE,
+        "actual_executor": _EXECUTOR_HERMES_PROFILE,
+        "requested_provider": provider,
+        "requested_model": model,
+        "actual_provider": provider,
+        "actual_model": model,
+        "fallback_from": None,
+        "fallback_reason": None,
+    }
+
+
+def _queue_executor_fallback_for_run(
+    conn: sqlite3.Connection,
+    task_id: str,
+    failed_run_id: Optional[int],
+    *,
+    error_text: str,
+) -> None:
+    """Queue the next sequential executor after a qualifying provider failure."""
+    if not _executor_fallback_enabled() or not failed_run_id:
+        return
+    failed_meta = _run_metadata_by_id(conn, failed_run_id)
+    failed_executor = str(
+        failed_meta.get("actual_executor")
+        or failed_meta.get("requested_executor")
+        or _EXECUTOR_HERMES_PROFILE
+    )
+    try:
+        prior_attempt = int(failed_meta.get("attempt_number") or 1)
+    except (TypeError, ValueError):
+        prior_attempt = 1
+    next_attempt = prior_attempt + 1
+    if next_attempt > _executor_fallback_max_attempts():
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                _EXECUTOR_FALLBACK_STOPPED_EVENT,
+                {
+                    "fallback_from": failed_run_id,
+                    "attempt_number": next_attempt,
+                    "reason": "max_attempts_reached",
+                    "error": error_text[:500],
+                },
+                run_id=failed_run_id,
+            )
+        return
+    if failed_executor == _EXECUTOR_HERMES_PROFILE:
+        next_executor = _EXECUTOR_CLAUDE_P
+        fallback_reason = "provider_quota_exhausted"
+        requested_provider = None
+        requested_model = None
+    elif failed_executor == _EXECUTOR_CLAUDE_P:
+        provider, model = _executor_lower_fallback_route()
+        next_executor = _EXECUTOR_HERMES_LOWER
+        fallback_reason = "claude_unavailable"
+        requested_provider = provider
+        requested_model = model
+    else:
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                _EXECUTOR_FALLBACK_STOPPED_EVENT,
+                {
+                    "fallback_from": failed_run_id,
+                    "attempt_number": next_attempt,
+                    "reason": "terminal_executor_failed",
+                    "failed_executor": failed_executor,
+                    "error": error_text[:500],
+                },
+                run_id=failed_run_id,
+            )
+        return
+
+    trow = conn.execute(
+        "SELECT assignee, workspace_path FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    handoff_state, handoff_payload = _workspace_handoff_state(
+        trow["workspace_path"] if trow else None
+    )
+    payload = {
+        "card_id": task_id,
+        "profile": trow["assignee"] if trow else failed_meta.get("profile"),
+        "fallback_from": int(failed_run_id),
+        "fallback_reason": fallback_reason,
+        "failed_executor": failed_executor,
+        "next_executor": next_executor,
+        "requested_executor": next_executor,
+        "actual_executor": next_executor,
+        "requested_provider": requested_provider,
+        "requested_model": requested_model,
+        "actual_provider": requested_provider,
+        "actual_model": requested_model,
+        "attempt_number": next_attempt,
+        "worktree_handoff": handoff_state,
+        "handoff": handoff_payload,
+        "qualifying_failure": "provider_unavailable",
+        "started_at": None,
+        "ended_at": None,
+        "outcome": "queued",
+    }
+    if handoff_state == "UNKNOWN_PARTIAL_STATE":
+        with write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', block_kind = 'transient', "
+                "last_failure_error = ? WHERE id = ? AND status = 'ready'",
+                (
+                    "executor fallback blocked: UNKNOWN_PARTIAL_STATE requires reconciliation",
+                    task_id,
+                ),
+            )
+            _append_event(
+                conn,
+                task_id,
+                _EXECUTOR_FALLBACK_BLOCKED_EVENT,
+                payload,
+                run_id=failed_run_id,
+            )
+        return
+    with write_txn(conn):
+        # Idempotence: one queued fallback per failed run.
+        dup = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? "
+            "AND json_extract(payload, '$.fallback_from') = ? LIMIT 1",
+            (task_id, _EXECUTOR_FALLBACK_EVENT, int(failed_run_id)),
+        ).fetchone()
+        if dup:
+            return
+        _append_event(conn, task_id, _EXECUTOR_FALLBACK_EVENT, payload, run_id=failed_run_id)
 
 
 # Worker-context caps so build_worker_context() stays bounded on
@@ -4927,19 +5315,29 @@ def claim_task(
         if cur.rowcount != 1:
             return None
         # Look up the current task row so we can populate the run with
-        # its assignee / step / runtime cap.
+        # its assignee / step / runtime cap and immutable attempt identity.
         trow = conn.execute(
-            "SELECT assignee, max_runtime_seconds, current_step_key "
+            "SELECT assignee, max_runtime_seconds, current_step_key, "
+            "model_override, provider_override "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
+        attempt_metadata = _base_attempt_metadata(
+            conn,
+            task_id,
+            profile=trow["assignee"] if trow else None,
+            model_override=trow["model_override"] if trow else None,
+            provider_override=trow["provider_override"] if trow else None,
+        )
+        attempt_metadata["started_at"] = now
+        attempt_metadata["outcome"] = "running"
         run_cur = conn.execute(
             """
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at, metadata
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -4949,6 +5347,7 @@ def claim_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
+                json.dumps(attempt_metadata, ensure_ascii=False),
             ),
         )
         run_id = run_cur.lastrowid
@@ -4961,6 +5360,14 @@ def claim_task(
             {"lock": lock, "expires": expires, "run_id": run_id},
             run_id=run_id,
         )
+        if attempt_metadata.get("fallback_from"):
+            _append_event(
+                conn,
+                task_id,
+                _EXECUTOR_FALLBACK_STARTED_EVENT,
+                {**attempt_metadata, "run_id": run_id},
+                run_id=run_id,
+            )
         claimed = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
@@ -5027,17 +5434,27 @@ def claim_review_task(
         if cur.rowcount != 1:
             return None
         trow = conn.execute(
-            "SELECT assignee, max_runtime_seconds, current_step_key "
+            "SELECT assignee, max_runtime_seconds, current_step_key, "
+            "model_override, provider_override "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
+        attempt_metadata = _base_attempt_metadata(
+            conn,
+            task_id,
+            profile=trow["assignee"] if trow else None,
+            model_override=trow["model_override"] if trow else None,
+            provider_override=trow["provider_override"] if trow else None,
+        )
+        attempt_metadata["started_at"] = now
+        attempt_metadata["outcome"] = "running"
         run_cur = conn.execute(
             """
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at, metadata
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -5047,6 +5464,7 @@ def claim_review_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
+                json.dumps(attempt_metadata, ensure_ascii=False),
             ),
         )
         run_id = run_cur.lastrowid
@@ -5060,6 +5478,14 @@ def claim_review_task(
              "source_status": "review"},
             run_id=run_id,
         )
+        if attempt_metadata.get("fallback_from"):
+            _append_event(
+                conn,
+                task_id,
+                _EXECUTOR_FALLBACK_STARTED_EVENT,
+                {**attempt_metadata, "run_id": run_id, "source_status": "review"},
+                run_id=run_id,
+            )
         return get_task(conn, task_id)
 
 
@@ -9719,11 +10145,24 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # record the run outcome as ``rate_limited`` so the board
                 # history doesn't show a phantom crash for a quota wall.
                 _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+                # Preserve the run's attempt identity (written at claim time)
+                # in the closure metadata: the executor-fallback chain reads
+                # failed_executor / attempt_number from the failed run.
+                _active_run_id = _current_run_id(conn, row["id"])
+                _prior_meta = {}
+                if _active_run_id is not None:
+                    _prior = conn.execute(
+                        "SELECT metadata FROM task_runs WHERE id = ?",
+                        (_active_run_id,),
+                    ).fetchone()
+                    _prior_meta = _json_dict(_prior["metadata"] if _prior else None)
+                _closure_meta = dict(_prior_meta)
+                _closure_meta.update(event_payload)
                 run_id = _end_run(
                     conn, row["id"],
                     outcome=_run_outcome, status=_run_outcome,
                     error=error_text,
-                    metadata=dict(event_payload),
+                    metadata=_closure_meta,
                 )
                 _append_event(
                     conn, row["id"], event_kind,
@@ -9860,6 +10299,32 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
+    # Executor-fallback queue: a provider-quota wall is a reroute trigger, not
+    # just a cooldown probe. Each rate-limited task gets exactly one queued
+    # fallback (next executor = claude -p, then the explicit lower route).
+    # Queued only after the main txn committed so workspace classification
+    # (git porcelain / fs probe) never runs inside a DB write lock.
+    if rate_limited and _executor_fallback_enabled():
+        with contextlib.closing(connect()) as _fb_conn:
+            for _tid in rate_limited:
+                _row = _fb_conn.execute(
+                    "SELECT current_run_id FROM tasks WHERE id = ?", (_tid,),
+                ).fetchone()
+                if _row and _row["current_run_id"]:
+                    _run_id = int(_row["current_run_id"])
+                else:
+                    _run_row = _fb_conn.execute(
+                        "SELECT id FROM task_runs WHERE task_id = ? "
+                        "ORDER BY id DESC LIMIT 1",
+                        (_tid,),
+                    ).fetchone()
+                    _run_id = int(_run_row["id"]) if _run_row else None
+                _queue_executor_fallback_for_run(
+                    _fb_conn,
+                    _tid,
+                    _run_id,
+                    error_text="provider quota exhausted (EX_TEMPFAIL sentinel)",
+                )
     # Worker-lifecycle observer (RFC #58548): exit events are tick-derived
     # from this reclaim pass — fired only now, after the main reclaim txn
     # AND the breaker accounting above have committed, so subscribers always
@@ -10191,7 +10656,19 @@ def check_respawn_guard(
     #    We look at the LATEST run only (ORDER BY ended_at DESC LIMIT 1): if a
     #    newer crash/completion superseded the rate-limit run, this guard
     #    no longer applies and the normal paths take over.
+    #
+    #    Executor-fallback override: when an ``executor_fallback_queued``
+    #    event is pending, the quota wall is not a "wait and probe the same
+    #    provider" signal — it is a reroute trigger. We defer to the
+    #    re-dispatch tick so the fallback attempt can be claimed immediately;
+    #    the previous ``blocker_auth`` check is also skipped because the
+    #    stamped rate-limit text must not park a card that has a real fallback
+    #    queued (an earlier fallback attempt re-stamps a quota-flavored
+    #    error on a later qualifying failure, and re-reading the raw task
+    #    error would loop it forever).
     rl_cooldown = _resolve_rate_limit_cooldown_seconds()
+    if _has_pending_executor_fallback(conn, task_id):
+        return None
     latest_run = conn.execute(
         "SELECT outcome, ended_at FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
@@ -11401,7 +11878,7 @@ def _dispatch_once_locked(
         claimed.skills = list(
             dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
         )
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        _spawn = spawn_fn if spawn_fn is not None else _fallback_aware_spawn
         try:
             import inspect
             try:
@@ -11721,6 +12198,128 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _retagged_workspace_roots.add(workspaces_root_path)
     except Exception as exc:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
+
+
+def _spawn_claude_fallback_wrapper(
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str] = None,
+) -> Optional[int]:
+    """Spawn the kanban_executor_fallback wrapper for a claude-p attempt.
+
+    The wrapper runs the real ``claude -p`` CLI against the SAME card context
+    (title + body) in the task workspace, then closes the card through the
+    canonical protocol (kanban_complete / kanban_block) or exits with the
+    EX_TEMPFAIL sentinel for a qualifying provider failure. Env pins mirror
+    ``_default_spawn`` so the wrapper resolves the same board/DB/workspace.
+    """
+    import subprocess
+
+    env = dict(os.environ)
+    # Strip gateway routing context exactly like _default_spawn.
+    try:
+        from gateway.session_context import _VAR_MAP
+        for key in _VAR_MAP:
+            env.pop(key, None)
+    except Exception:
+        pass
+    # The wrapper opens the board DB through the same env resolution chain the
+    # dispatcher pin relies on (symmetric with _default_spawn).
+    resolved_board = _normalize_board_slug(board) or get_current_board()
+    env["HERMES_KANBAN_DB"] = str(kanban_db_path(board=board))
+    env["HERMES_KANBAN_BOARD"] = resolved_board
+    try:
+        env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(workspaces_root(board=board))
+    except Exception:
+        pass
+    env["HERMES_KANBAN_TASK"] = task.id
+    env["HERMES_KANBAN_WORKSPACE"] = workspace
+    env["HERMES_SESSION_SOURCE"] = "kanban"
+    if task.current_run_id is not None:
+        env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
+    if task.claim_lock:
+        env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
+    if task.branch_name:
+        env["HERMES_KANBAN_BRANCH"] = task.branch_name
+    if task.tenant:
+        env["HERMES_TENANT"] = task.tenant
+    env.pop("HERMES_TUI", None)
+    if workspace and os.path.isabs(workspace) and os.path.isdir(workspace):
+        env["TERMINAL_CWD"] = workspace
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "hermes_cli.kanban_executor_fallback",
+        task.id,
+        workspace,
+    ]
+    log_dir = worker_logs_dir(board=board)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{task.id}.log"
+    rotate_bytes, backup_count = worker_log_rotation_config()
+    _rotate_worker_log(log_path, rotate_bytes, backup_count)
+    log_f = open(log_path, "ab")
+    try:
+        proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
+            cmd,
+            cwd=workspace if os.path.isdir(workspace) else None,
+            stdin=subprocess.DEVNULL,
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            env=env,
+            start_new_session=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+        )
+    except FileNotFoundError:
+        log_f.close()
+        raise RuntimeError(
+            "python interpreter for the claude-p fallback wrapper not found: "
+            f"{sys.executable!r}"
+        )
+    return proc.pid
+
+
+def _fallback_aware_spawn(
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str] = None,
+) -> Optional[int]:
+    """Dispatcher default spawn: normal cards keep the Hermes worker path;
+    queued executor-fallback attempts route to the right backend.
+
+    * ``claude-p`` -> the claude wrapper (real ``claude -p`` on the same card).
+    * ``hermes-lower-fallback`` -> the SAME Hermes worker command but with the
+      explicit approved openrouter/deepseek route pinned via ``-m/--provider``
+      (never the profile's OpenAI default, never ``fallback_providers``).
+    """
+    try:
+        from dataclasses import replace
+
+        with contextlib.closing(connect()) as _conn:
+            pending = _pending_executor_fallback_event(_conn, task.id)
+    except Exception as _exc:
+        pending = None
+        replace = None  # type: ignore[assignment]
+    if pending is None:
+        return _default_spawn(task, workspace, board=board)
+    _, payload = pending
+    executor = payload.get("next_executor")
+    if executor == _EXECUTOR_CLAUDE_P:
+        return _spawn_claude_fallback_wrapper(task, workspace, board=board)
+    if executor == _EXECUTOR_HERMES_LOWER and replace is not None:
+        provider, model = _executor_lower_fallback_route()
+        patched = replace(
+            task,
+            model_override=model,
+            provider_override=provider,
+        )
+        return _default_spawn(patched, workspace, board=board)
+    # Unknown executor tag: fail closed to the normal path; the queued event
+    # stays unconsumed and the guard keeps releasing the card next tick.
+    return _default_spawn(task, workspace, board=board)
 
 
 def _default_spawn(
