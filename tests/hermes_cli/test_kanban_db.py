@@ -816,6 +816,30 @@ def test_dispatch_once_real_default_spawn_routes_fallback_card_to_wrapper(
         assert called["task"].id == tid
 
 
+def test_end_run_without_metadata_preserves_attempt_identity(
+    kanban_home, monkeypatch,
+):
+    """A run closure that passes no metadata must NOT wipe the claim-time
+    attempt identity: _fallback_aware_spawn and the fallback chain read
+    requested_executor/fallback_from from task_runs.metadata. The old
+    behaviour overwrote metadata with NULL whenever the caller omitted it,
+    silently losing which executor attempted the card."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="identity", assignee="alice")
+        claimed = kb.claim_task(conn, tid)
+        run_id = claimed.current_run_id
+        meta = _run_metadata(conn, run_id)
+        assert meta.get("requested_executor") == "hermes-profile"
+        assert meta.get("attempt_number") == 1
+
+        kb._end_run(conn, tid, outcome="rate_limited", error="quota", metadata=None)
+
+        preserved = _run_metadata(conn, run_id)
+        assert preserved.get("requested_executor") == "hermes-profile"
+        assert preserved.get("attempt_number") == 1
+        assert preserved.get("outcome") == "rate_limited"
+
+
 def test_check_respawn_guard_ignores_workspace_resolution_failure(kanban_home):
     """A spawn failure from workspace resolution must NOT trip ``blocker_auth``.
 

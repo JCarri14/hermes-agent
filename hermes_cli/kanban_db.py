@@ -4925,11 +4925,19 @@ def _end_run(
     #   (and feeds any later reap/review) instead of erasing it in the same
     #   transition — D4 C4.
     _prev = conn.execute(
-        "SELECT worker_pid, claim_lock FROM task_runs WHERE id = ?",
+        "SELECT worker_pid, claim_lock, metadata FROM task_runs WHERE id = ?",
         (run_id,),
     ).fetchone()
     if _prev is not None:
         _merged = dict(metadata) if metadata else {}
+        if not metadata and _json_dict(_prev["metadata"]):
+            # Closure without a metadata payload must not wipe the claim-time
+            # attempt identity (executor-fallback chain reads it afterwards);
+            # still stamp the closure outcome/status on top of the preserved
+            # identity so the run record reflects how it ended.
+            _merged = _json_dict(_prev["metadata"])
+            _merged["outcome"] = outcome
+            _merged["status"] = status or outcome
         if (_prev["worker_pid"] or _prev["claim_lock"]) and (
             "prev_worker_pid" not in _merged
         ):
