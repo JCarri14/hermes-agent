@@ -344,7 +344,8 @@ class CLIAgentSetupMixin:
         Returns:
             bool: True if successful, False otherwise
         """
-        from cli import AIAgent, ChatConsole, _DIM, _RST, _accent_hex, _cprint, _prepare_deferred_agent_startup, logger
+        from cli import CLI_CONFIG, AIAgent, ChatConsole, _DIM, _RST, _accent_hex, _cprint, _prepare_deferred_agent_startup, logger
+        from hermes_cli.interactive_fallback import build_session_fallback_chain
         if self.agent is not None:
             return True
 
@@ -524,7 +525,7 @@ class CLIAgentSetupMixin:
                 clarify_callback=self._clarify_callback,
                 reasoning_callback=self._current_reasoning_callback(),
 
-                fallback_model=self._fallback_model,
+                fallback_model=build_session_fallback_chain(CLI_CONFIG),
                 thinking_callback=self._on_thinking,
                 checkpoints_enabled=self.checkpoints_enabled,
                 checkpoint_max_snapshots=self.checkpoint_max_snapshots,
