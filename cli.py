@@ -21024,6 +21024,28 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 # Main Entry Point
 # ============================================================================
 
+def _kanban_goal_turn_rate_limited(error: Exception) -> bool:
+    """True when a goal-loop turn's provider exception is a quota wall.
+
+    Reuses the canonical ``classify_api_error`` pipeline (the same one the
+    conversation loop feeds) and mirrors the first-turn sentinel set from
+    the ``-Q`` exit-code path: only ``rate_limit`` / ``billing`` (HTTP 429 /
+    usage-limit / quota exhaustion) count — NEVER auth 401/403, tool errors,
+    task errors, or 5xx timeouts. Classification plumbing must never turn a
+    worker crash into a sentinel exit, so any classifier failure returns
+    False (the run keeps today's generic failure path).
+    """
+    try:
+        from agent.error_classifier import FailoverReason, classify_api_error
+        classified = classify_api_error(error)
+        return classified.reason in (
+            FailoverReason.rate_limit,
+            FailoverReason.billing,
+        )
+    except Exception:
+        return False
+
+
 def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     """Drive a kanban goal_mode worker through the Ralph-style goal loop.
 
@@ -21032,7 +21054,10 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     goal_mode card). Wires the worker's ``run_conversation`` and the kanban
     DB into ``goals.run_kanban_goal_loop``. All errors are swallowed by the
     caller — a broken goal loop must never wedge a worker, the dispatcher's
-    claim TTL / crash detection is the backstop.
+    claim TTL / crash detection is the backstop. The ONE deliberate
+    exception: a provider quota wall (HTTP 429 / usage-limit) surfacing on a
+    later goal-loop turn exits with the ``KANBAN_RATE_LIMIT_EXIT_CODE``
+    sentinel so the dispatcher requeues the card without counting a failure.
     """
     import os as _os
 
@@ -21048,7 +21073,11 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             logger.warning("invalid HERMES_KANBAN_RUN_ID=%r", raw_run_id)
 
     from hermes_cli import kanban_db as _kb
-    from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS
+    from hermes_cli.goals import (
+        run_kanban_goal_loop as _run_loop,
+        DEFAULT_MAX_TURNS as _DEF_TURNS,
+        KanbanRateLimitExit as _KRLExit,
+    )
 
     # Resolve goal text from the card (title + body = the acceptance
     # criteria the judge evaluates against).
@@ -21073,10 +21102,22 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     max_turns = task.goal_max_turns or _DEF_TURNS
 
     def _run_turn(prompt: str) -> str:
-        result = cli.agent.run_conversation(
-            user_message=prompt,
-            conversation_history=cli.conversation_history,
-        )
+        try:
+            result = cli.agent.run_conversation(
+                user_message=prompt,
+                conversation_history=cli.conversation_history,
+            )
+        except _KRLExit:
+            raise
+        except Exception as _turn_exc:
+            # A provider quota wall (HTTP 429 / usage-limit) raised from
+            # THIS turn must surface as the EX_TEMPFAIL sentinel exit, not
+            # as a generic run_turn failure — the dispatcher releases the
+            # card back to ``ready`` without counting a failure. Any other
+            # exception keeps today's "stopped" path in the goal loop.
+            if _kanban_goal_turn_rate_limited(_turn_exc):
+                raise _KRLExit(str(_turn_exc)) from _turn_exc
+            raise
         # Keep session_id in sync if mid-run compression rotated it.
         if (
             getattr(cli.agent, "session_id", None)
@@ -21084,6 +21125,18 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         ):
             cli.session_id = cli.agent.session_id
         resp = result.get("final_response", "") if isinstance(result, dict) else str(result)
+        # Mirrors the first-turn exit-code classification in the ``-Q`` path
+        # below: a run that failed on a provider quota wall exits with the
+        # rate-limit sentinel instead of spinning the goal loop on empty
+        # responses until the turn budget blocks the card.
+        if (
+            isinstance(result, dict)
+            and result.get("failed")
+            and result.get("failure_reason") in ("rate_limit", "billing")
+        ):
+            raise _KRLExit(
+                str(result.get("error") or result.get("failure_reason"))
+            )
         if resp:
             print(resp)
         return resp or ""
@@ -21113,16 +21166,32 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             except Exception:
                 pass
 
-    _run_loop(
-        task_id=task_id,
-        goal_text=goal_text,
-        run_turn=_run_turn,
-        task_status_fn=_task_status,
-        block_fn=_block,
-        max_turns=max_turns,
-        first_response=first_response or "",
-        log=lambda m: logger.info("%s", m),
-    )
+    try:
+        _run_loop(
+            task_id=task_id,
+            goal_text=goal_text,
+            run_turn=_run_turn,
+            task_status_fn=_task_status,
+            block_fn=_block,
+            max_turns=max_turns,
+            first_response=first_response or "",
+            log=lambda m: logger.info("%s", m),
+        )
+    except _KRLExit as _rl_exc:
+        # Provider quota wall detected mid goal-loop: exit with the
+        # EX_TEMPFAIL sentinel so the dispatcher's reap classifier maps the
+        # run to ``rate_limited`` and releases the card back to ``ready``
+        # WITHOUT counting a failure — mirrors the first-turn quota-wall
+        # exit in the ``-Q`` path. Kanban-only by construction: this helper
+        # returns early unless ``HERMES_KANBAN_TASK`` is set, and
+        # ``_run_turn`` is only reachable from the kanban goal loop.
+        _rl_code = getattr(_kb, "KANBAN_RATE_LIMIT_EXIT_CODE", 75)
+        logger.info(
+            "kanban goal loop hit a provider quota wall (%s); exiting with sentinel %s",
+            _rl_exc,
+            _rl_code,
+        )
+        sys.exit(_rl_code)
 
 
 def main(
