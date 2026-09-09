@@ -128,6 +128,50 @@ def test_loop_stops_when_worker_already_completed(monkeypatch):
     assert turns == []  # no extra turns
 
 
+# ---------------------------------------------------------------------------
+# Rate-limit sentinel inside the goal loop
+# ---------------------------------------------------------------------------
+
+class TestKanbanGoalLoopRateLimitSentinel:
+    """A provider quota wall (HTTP 429 / usage limit) hit on a goal-loop turn
+    must propagate as ``KanbanRateLimitExit`` so the CLI worker can exit with
+    the EX_TEMPFAIL sentinel instead of a generic ``"stopped"`` run — any
+    other run_turn error keeps the existing ``"stopped"`` contract."""
+
+    def test_run_turn_rate_limit_sentinel_propagates(self, monkeypatch):
+        _patch_judge(monkeypatch, ["continue"])
+
+        def _run_turn(_prompt):
+            raise goals.KanbanRateLimitExit("usage limit reached")
+
+        with pytest.raises(goals.KanbanRateLimitExit):
+            goals.run_kanban_goal_loop(
+                task_id="t1",
+                goal_text="do the thing",
+                run_turn=_run_turn,
+                task_status_fn=lambda: "ready",
+                block_fn=lambda r: pytest.fail("must not block"),
+                first_response="started",
+            )
+
+    def test_run_turn_other_error_still_returns_stopped(self, monkeypatch):
+        _patch_judge(monkeypatch, ["continue"])
+
+        def _run_turn(_prompt):
+            raise ValueError("tool exploded")
+
+        res = goals.run_kanban_goal_loop(
+            task_id="t1",
+            goal_text="do the thing",
+            run_turn=_run_turn,
+            task_status_fn=lambda: "ready",
+            block_fn=lambda r: pytest.fail("must not block"),
+            first_response="started",
+        )
+        assert res["outcome"] == "stopped"
+        assert "run_turn error" in res["reason"]
+
+
 
 
 

@@ -2165,6 +2165,23 @@ KANBAN_GOAL_FINALIZE_TEMPLATE = (
 )
 
 
+class KanbanRateLimitExit(Exception):
+    """Provider quota wall detected inside a kanban goal-loop turn.
+
+    Raised by the goal-loop ``run_turn`` callback (the CLI wires it in
+    ``cli._run_kanban_goal_loop_q``) whenever a turn failed on a provider
+    rate limit / usage-limit wall (HTTP 429, ``usage_limit_reached``, ...).
+    ``run_kanban_goal_loop`` re-raises it instead of collapsing it into the
+    generic ``"stopped"`` outcome, so the worker process can exit with the
+    ``KANBAN_RATE_LIMIT_EXIT_CODE`` sentinel. The dispatcher's reap
+    classifier maps that code to a ``rate_limited`` run outcome and releases
+    the task back to ``ready`` WITHOUT counting a failure.
+
+    This exception is only ever raised while driving a kanban goal-mode
+    worker, so non-kanban goal loops (interactive ``/goal``) are unaffected.
+    """
+
+
 def run_kanban_goal_loop(
     *,
     task_id: str,
@@ -2292,6 +2309,12 @@ def run_kanban_goal_loop(
         # Run another turn in the same session.
         try:
             last_response = run_turn(prompt) or ""
+        except KanbanRateLimitExit:
+            # Provider quota wall mid-loop: propagate so the CLI worker can
+            # exit with the EX_TEMPFAIL sentinel instead of downgrading to a
+            # generic "stopped" run (which the dispatcher would treat as a
+            # crash/failure). See ``KanbanRateLimitExit``.
+            raise
         except Exception as exc:
             _log(f"kanban goal loop: run_turn failed ({exc}); stopping")
             return {"outcome": "stopped", "turns_used": turns_used, "reason": f"run_turn error: {type(exc).__name__}"}
@@ -2323,4 +2346,5 @@ __all__ = [
     "migrate_goal_to_session",
     "judge_goal",
     "run_kanban_goal_loop",
+    "KanbanRateLimitExit",
 ]
