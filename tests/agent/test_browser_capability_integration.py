@@ -35,7 +35,7 @@ from agent.browser_capability_broker import (
 )
 from agent.browser_lease_store import BrowserLeaseStore, LeaseStatus
 from tools.browser_backend_adapters import DomPrimitivesAdapter
-from tools.browser_evidence import BrowserEvidenceAdapter
+from tools.browser_evidence import BrowserEvidenceAdapter, sha256_of_text
 
 
 def make_action(
@@ -45,6 +45,7 @@ def make_action(
     raw=None,
     task_id="card-1",
     run_id="run-1",
+    target_ref=None,
     **kw,
 ):
     return BrowserAction(
@@ -53,7 +54,7 @@ def make_action(
         task_id=task_id,
         run_id=run_id,
         attempt_id=kw.pop("attempt_id", "1"),
-        target=BrowserTarget(domain=domain, url=url),
+        target=BrowserTarget(domain=domain, url=url, ref=target_ref),
         payload=BrowserPayload(kind="none", raw=raw),
         session_lease_id=kw.pop("session_lease_id", "lease-card-1-run-1"),
         **kw,
@@ -77,6 +78,7 @@ class TestFullChain:
                     backend_name=self.name,
                     backend_version="test-1",
                     result={"url": "https://example.com/"},
+                    evidence=[{"kind": "text", "content": "snapshot"}],
                 )
 
         store = BrowserLeaseStore()
@@ -95,16 +97,70 @@ class TestFullChain:
         receipt = broker.execute(
             action, lease=lease, evidence_adapter=evidence,
         )
-        assert receipt.succeeded or True
-        # evidence was normalized onto the result
-        assert receipt.backend_name in ("dom", "RecordingAdapter") or True
+        # Real assertions (no more `or True` tautologies): the chain must
+        # reach the adapter, succeed, and normalize evidence through the
+        # BrowserReceipt dataclass (F3 regression guard).
+        assert receipt.succeeded is True
+        assert receipt.status is ExecutionStatus.DONE
+        assert receipt.backend_name == "dom"
+        assert receipt.evidence == [sha256_of_text("snapshot")]
 
         # Decide → build receipt explicitly to assert the projection shape.
+        # (raw_evidence passed explicitly: broker.execute already normalized
+        #  result.evidence into hashed refs, and build_receipt must not
+        #  re-hash them.)
         decision = broker.decide(action, lease)
         assert decision.decision is Decision.PERMIT
-        built = evidence.build_receipt(action, receipt, lease=lease, decision=decision)
+        built = evidence.build_receipt(
+            action, receipt, lease=lease, decision=decision,
+            raw_evidence=[{"kind": "text", "content": "snapshot"}],
+        )
         assert built.browser["backend"]["name"] == receipt.backend_name
         assert built.postcondition["status"] == "UNVERIFIED"  # no verify after success
+
+    def test_execute_resolves_lease_by_ownership_from_store(self):
+        """F2 wiring: broker+lease_store — execute() without an explicit lease
+        must resolve it via get_by_ownership(task_id, run_id), not TypeError
+        on lease_store.get(lease_id)."""
+        reached = []
+
+        class RecordingAdapter(DomPrimitivesAdapter):
+            def execute(self, attempt: ExecutionAttempt) -> ExecutionResult:
+                reached.append(attempt.action.verb.value)
+                return ExecutionResult(
+                    status=ExecutionStatus.DONE,
+                    backend_name=self.name,
+                    backend_version="1",
+                )
+
+        store = BrowserLeaseStore()
+        lease = store.request(task_id="card-1", run_id="run-1", domains=["example.com"])
+        store.activate(lease)
+
+        broker = BrowserCapabilityBroker(
+            adapters=[RecordingAdapter()],
+            decision_provider=FailClosedDecisionProvider(),
+            lease_store=store,
+        )
+        action = make_action(task_id="card-1", run_id="run-1")
+        # No `lease=` passed: the broker must resolve it from the store.
+        result = broker.execute(action)
+        assert result.status is ExecutionStatus.DONE
+        assert result.backend_name == "dom"
+        assert reached == ["navigate"]
+
+    def test_execute_with_unknown_ownership_fails_closed(self):
+        """F2 negative: no lease for the task/run ⇒ FAILED (GEA_SESSION_LEASE_MISSING),
+        never an unhandled TypeError."""
+        store = BrowserLeaseStore()
+        broker = BrowserCapabilityBroker(
+            adapters=[DomPrimitivesAdapter()],
+            decision_provider=FailClosedDecisionProvider(),
+            lease_store=store,
+        )
+        result = broker.execute(make_action(task_id="card-9", run_id="run-9"))
+        assert result.status is ExecutionStatus.FAILED
+        assert result.failure_category == "GEA_SESSION_LEASE_MISSING"
 
     def test_denied_action_never_reaches_the_adapter(self):
         reached = []
@@ -460,9 +516,97 @@ class TestRestrictedFallback:
         assert result.retryable is True
 
 
+class TestDomAdapterRealMappings:
+    """G1: exercise the REAL DomPrimitivesAdapter.execute() mapping
+    (verb → tool → args), which stubs elsewhere override. The browser_tool
+    handlers are monkeypatched to record the exact args the adapter builds —
+    no live browser needed."""
+
+    def _run(self, action, monkeypatch, handler_name, return_value="{}"):
+        calls = {}
+
+        def fake_handler(**kwargs):
+            calls.update(kwargs)
+            return return_value
+
+        monkeypatch.setattr(f"tools.browser_tool.{handler_name}", fake_handler)
+        adapter = DomPrimitivesAdapter()
+        result = adapter.execute(
+            ExecutionAttempt(action=action, decision=None, envelope={})
+        )
+        return result, calls
+
+    def test_navigate_maps_url_and_task_id(self, monkeypatch):
+        action = make_action()  # NAVIGATE example.com
+        result, calls = self._run(action, monkeypatch, "browser_navigate")
+        assert result.status is ExecutionStatus.DONE
+        assert result.backend_name == "dom"
+        assert calls == {"url": "https://example.com/", "task_id": "card-1"}
+
+    def test_click_maps_ref(self, monkeypatch):
+        action = make_action(
+            verb=BrowserVerb.CLICK, raw={},
+            target_ref="@e5", url="https://example.com/x",
+        )
+        result, calls = self._run(action, monkeypatch, "browser_click")
+        assert result.status is ExecutionStatus.DONE
+        assert calls == {"ref": "@e5", "task_id": "card-1"}
+
+    def test_submit_with_ref_maps_to_click(self, monkeypatch):
+        """§4.1: submit → browser_click(ref) when a submit-control ref exists."""
+        action = make_action(
+            verb=BrowserVerb.SUBMIT, raw={"action": "confirm"},
+            target_ref="@e9", url="https://example.com/x",
+        )
+        result, calls = self._run(action, monkeypatch, "browser_click")
+        assert result.status is ExecutionStatus.DONE
+        assert calls == {"ref": "@e9", "task_id": "card-1"}
+
+    def test_submit_without_ref_maps_to_press(self, monkeypatch):
+        """§4.1: submit without a ref → browser_press(key) with a default Enter."""
+        action = make_action(
+            verb=BrowserVerb.SUBMIT, raw={"action": "confirm"},
+            url="https://example.com/x",
+        )
+        result, calls = self._run(action, monkeypatch, "browser_press")
+        assert result.status is ExecutionStatus.DONE
+        assert calls == {"key": "Enter", "task_id": "card-1"}
+
+    def test_submit_without_ref_custom_key(self, monkeypatch):
+        action = make_action(
+            verb=BrowserVerb.SUBMIT, raw={"action": "confirm", "key": "Tab"},
+            url="https://example.com/x",
+        )
+        result, calls = self._run(action, monkeypatch, "browser_press")
+        assert result.status is ExecutionStatus.DONE
+        assert calls == {"key": "Tab", "task_id": "card-1"}
+
+    def test_type_maps_ref_and_text(self, monkeypatch):
+        action = make_action(
+            verb=BrowserVerb.TYPE, raw={"text": "hello"},
+            target_ref="@e3", url="https://example.com/x",
+        )
+        result, calls = self._run(action, monkeypatch, "browser_type")
+        assert result.status is ExecutionStatus.DONE
+        assert calls == {"ref": "@e3", "text": "hello", "task_id": "card-1"}
+
+    def test_extract_unsupported_verb_fails_closed(self, monkeypatch):
+        """A verb with no DOM primitive (extract) never reaches a handler —
+        the adapter returns GEA_CAPABILITY_OUT_OF_SCOPE."""
+        action = make_action(
+            verb=BrowserVerb.EXTRACT, raw={}, url="https://example.com/x",
+        )
+        result, calls = self._run(action, monkeypatch, "browser_click")
+        assert result.status is ExecutionStatus.FAILED
+        assert result.failure_category == "GEA_CAPABILITY_OUT_OF_SCOPE"
+        assert calls == {}
+
+
 class TestCapabilityBudget:
     def test_budget_caps_deny_verb_out_of_scope(self):
-        """GEA §8: a capability budget that excludes a verb's cap denies."""
+        """GEA §8: a capability budget that excludes a verb's cap denies —
+        evaluated BEFORE the permission/approval branches (F1 regression:
+        the ceiling used to be unreachable dead code)."""
         store = BrowserLeaseStore()
         lease = store.request(
             task_id="c1", run_id="r1", domains=["example.com"],
@@ -479,10 +623,84 @@ class TestCapabilityBudget:
             task_id="c1", run_id="r1", verb=BrowserVerb.SUBMIT,
             raw={"action": "x"}, url="https://example.com/x",
         )
-        # Side effect without grant → require_approval regardless of budget.
+        # Budget ceiling is evaluated before the side-effect approval branch:
+        # submit needs write/send => out of scope, NOT require_approval.
         result = broker.execute(action, lease=lease)
-        assert result.status is ExecutionStatus.INTENT
-        assert result.failure_category == "GEA_HUMAN_APPROVAL_REQUIRED"
+        assert result.status is ExecutionStatus.FAILED
+        assert result.failure_category == "GEA_CAPABILITY_OUT_OF_SCOPE"
+
+    def test_budget_denies_write_verbs_under_read_only_budget(self):
+        """QA probe: CLICK/TYPE with {caps:[read]} must DENY
+        GEA_CAPABILITY_OUT_OF_SCOPE (previously permitted silently)."""
+        store = BrowserLeaseStore()
+        lease = store.request(
+            task_id="c1", run_id="r1", domains=["example.com"],
+            capability_budget={"caps": ["read"]},
+        )
+        store.activate(lease)
+
+        broker = BrowserCapabilityBroker(
+            adapters=[DomPrimitivesAdapter()],
+            decision_provider=FailClosedDecisionProvider(),
+            capability_budget={"caps": ["read"]},
+        )
+        for verb in (BrowserVerb.CLICK, BrowserVerb.TYPE):
+            action = make_action(
+                task_id="c1", run_id="r1", verb=verb,
+                raw={"ref": "@e5", "text": "x"},
+                url="https://example.com/x",
+            )
+            result = broker.execute(action, lease=lease)
+            assert result.status is ExecutionStatus.FAILED, verb
+            assert result.failure_category == "GEA_CAPABILITY_OUT_OF_SCOPE", verb
+
+    def test_budget_denies_side_effect_despite_grant(self):
+        """A matching grant cannot widen beyond the card budget: the
+        capability ceiling is evaluated before the grant is consulted."""
+        store = BrowserLeaseStore()
+        lease = store.request(
+            task_id="c1", run_id="r1", domains=["example.com"],
+            capability_budget={"caps": ["read"]},
+        )
+        store.activate(lease)
+
+        broker = BrowserCapabilityBroker(
+            adapters=[DomPrimitivesAdapter()],
+            decision_provider=FailClosedDecisionProvider(),
+            capability_budget={"caps": ["read"]},
+        )
+        action = make_action(
+            task_id="c1", run_id="r1", verb=BrowserVerb.SUBMIT,
+            raw={"action": "x"}, url="https://example.com/x",
+        )
+        grant = {
+            "authorization_id": "auth-1",
+            "scope": "ONE_SHOT",
+            "params_digest": action.payload.params_digest,
+            "revoked": False,
+        }
+        result = broker.execute(action, lease=lease, grant=grant)
+        assert result.status is ExecutionStatus.FAILED
+        assert result.failure_category == "GEA_CAPABILITY_OUT_OF_SCOPE"
+
+    def test_budget_caps_allow_read_within_budget(self):
+        """Sanity: the ceiling denies only what the caps exclude — a read
+        verb inside a read budget is still permitted (decision level, no
+        live browser needed)."""
+        store = BrowserLeaseStore()
+        lease = store.request(
+            task_id="c1", run_id="r1", domains=["example.com"],
+            capability_budget={"caps": ["read"]},
+        )
+        store.activate(lease)
+        broker = BrowserCapabilityBroker(
+            adapters=[DomPrimitivesAdapter()],
+            decision_provider=FailClosedDecisionProvider(),
+            capability_budget={"caps": ["read"]},
+        )
+        action = make_action(task_id="c1", run_id="r1", verb=BrowserVerb.READ_SNAPSHOT)
+        decision = broker.decide(action, lease=lease, capability_budget={"caps": ["read"]})
+        assert decision.decision is Decision.PERMIT
 
     def test_budget_read_allows_navigate(self):
         store = BrowserLeaseStore()

@@ -117,16 +117,6 @@ class DomPrimitivesAdapter(BrowserBackendAdapter):
         try:
             from tools import browser_tool
 
-            handler = getattr(browser_tool, tool, None)
-            if handler is None:
-                return ExecutionResult(
-                    status=ExecutionStatus.FAILED,
-                    backend_name=self.name,
-                    backend_version=self.version,
-                    error="GEA_BACKEND_UNAVAILABLE",
-                    failure_category="GEA_BACKEND_UNAVAILABLE",
-                    retryable=True,
-                )
             args: Dict[str, Any] = {"task_id": action.task_id}
             if action.target and action.target.url and action.verb is BrowserVerb.NAVIGATE:
                 args["url"] = action.target.url
@@ -135,6 +125,8 @@ class DomPrimitivesAdapter(BrowserBackendAdapter):
             if action.verb is BrowserVerb.SUBMIT:
                 # submit maps to a click on the submit control (ref) or a
                 # press of a key (Enter / button key) when no ref exists.
+                # The tool swap MUST happen before the handler is resolved,
+                # or the click handler would receive the press args.
                 if action.target.ref:
                     args["ref"] = action.target.ref
                 elif action.payload and action.payload.raw:
@@ -153,6 +145,16 @@ class DomPrimitivesAdapter(BrowserBackendAdapter):
                 args["expression"] = str(action.payload.raw.get("expression", ""))
             if action.verb is BrowserVerb.VISION and action.payload.raw:
                 args["question"] = str(action.payload.raw.get("question", ""))
+            handler = getattr(browser_tool, tool, None)
+            if handler is None:
+                return ExecutionResult(
+                    status=ExecutionStatus.FAILED,
+                    backend_name=self.name,
+                    backend_version=self.version,
+                    error="GEA_BACKEND_UNAVAILABLE",
+                    failure_category="GEA_BACKEND_UNAVAILABLE",
+                    retryable=True,
+                )
             raw = handler(**args)
             return ExecutionResult(
                 status=ExecutionStatus.DONE,

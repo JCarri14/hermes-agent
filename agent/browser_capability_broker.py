@@ -566,6 +566,19 @@ class FailClosedDecisionProvider:
         # reads because SESSION ACCESS is first-class).
         if action.verb in LIFECYCLE_VERBS:
             return AuthorizationDecision(Decision.PERMIT, "GEA_OK")
+
+        # Budget ceiling (GEA §8): evaluated BEFORE any permission branch so
+        # a card capability budget can never be bypassed by the lease / read /
+        # UI / grant paths below (authority widening). A verb whose capability
+        # class is not listed is out of scope, period. A falsy budget (None or
+        # an empty dict) means no ceiling is configured; an explicit
+        # ``{"caps": [...]}`` (even with an empty caps list) is a real ceiling.
+        if budget and not _verb_allowed_by_budget(action.verb, budget):
+            return AuthorizationDecision(
+                Decision.DENY, REASON_CAPABILITY_OUT_OF_SCOPE,
+                message_human="verb not allowed by card capability budget",
+            )
+
         if action.verb is BrowserVerb.NAVIGATE and not action.is_side_effect:
             if lease is None or not getattr(lease, "is_active", False):
                 return AuthorizationDecision(
@@ -626,14 +639,6 @@ class FailClosedDecisionProvider:
             BrowserVerb.BACK, BrowserVerb.PRESS, BrowserVerb.DIALOG,
         ):
             return AuthorizationDecision(Decision.PERMIT, "GEA_OK")
-
-        # Budget ceiling: if a capability budget was supplied and the verb's
-        # capability class is not listed, deny.
-        if budget is not None and not _verb_allowed_by_budget(action.verb, budget):
-            return AuthorizationDecision(
-                Decision.DENY, REASON_CAPABILITY_OUT_OF_SCOPE,
-                message_human="verb not allowed by card capability budget",
-            )
 
         return AuthorizationDecision(
             Decision.DENY, REASON_AUTHORIZATION_MISSING,
@@ -727,11 +732,7 @@ class BrowserCapabilityBroker:
     def envelope(self, action: BrowserAction, lease: Optional[Any]) -> Dict[str, Any]:
         """Compute the authority envelope (never widened by resolution)."""
         profile_mode = (lease.profile_mode if lease is not None else None) or action.profile_mode
-        budget = context_budget = (self._capability_budget or {})
-        # lease-level budget (from the session lease) is more specific
-        lease_budget = getattr(lease, "capability_budget", None)
-        if isinstance(lease_budget, dict):
-            budget = lease_budget or budget
+        budget = self._effective_budget(lease)
         manifest = dict(self._manifest_ceiling or {})
         return {
             "profile_mode": profile_mode.value if isinstance(profile_mode, ProfileMode) else str(profile_mode),
@@ -739,6 +740,15 @@ class BrowserCapabilityBroker:
             "manifest_ceiling": manifest,
             "data_sensitivity_ceiling": self._data_sensitivity_ceiling,
         }
+
+    def _effective_budget(self, lease: Optional[Any]) -> Dict[str, Any]:
+        """Merged capability budget: a lease-level budget (session lease) is
+        more specific than the broker-level one and wins when present."""
+        budget = dict(self._capability_budget or {})
+        lease_budget = getattr(lease, "capability_budget", None)
+        if isinstance(lease_budget, dict):
+            budget = lease_budget or budget
+        return budget
 
     def _risk_allowed_in_envelope(self, risk: RiskProfile, envelope: Dict[str, Any]) -> bool:
         profile_mode = envelope.get("profile_mode", "isolated")
@@ -864,9 +874,13 @@ class BrowserCapabilityBroker:
         privileged risk profile; never retries blindly after an ambiguous
         effect (caller must VERIFY BEFORE RETRY).
         """
-        # 1. Resolve the lease if not provided.
+        # 1. Resolve the lease if not provided. The kwargs default to the
+        # action's own identity — the action IS the task/run context.
         if lease is None and self._lease_store is not None:
-            lease = self._lease_store.get(task_id=task_id, run_id=run_id)
+            lease = self._lease_store.get_by_ownership(
+                task_id=task_id or action.task_id,
+                run_id=run_id or action.run_id,
+            )
         if lease is None and self._lease_store is not None:
             return ExecutionResult(
                 status=ExecutionStatus.FAILED,
@@ -878,7 +892,10 @@ class BrowserCapabilityBroker:
             )
 
         # 2. Decision before effect.
-        decision = self.decide(action, lease=lease, grant=grant, capability_budget=self._capability_budget)
+        decision = self.decide(
+            action, lease=lease, grant=grant,
+            capability_budget=self._effective_budget(lease),
+        )
         if decision.is_deny:
             return ExecutionResult(
                 status=ExecutionStatus.FAILED,
@@ -972,7 +989,10 @@ class BrowserCapabilityBroker:
         if evidence_adapter is not None and result.status not in (ExecutionStatus.INTENT,):
             try:
                 receipt = evidence_adapter.build_receipt(action, result, lease=lease, decision=decision)
-                result.evidence = receipt.get("browser", {}).get("evidence_refs", []) or []
+                # ``receipt`` is a BrowserReceipt dataclass (tools.browser_evidence),
+                # NOT a plain dict — read the browser block attribute directly.
+                browser_block = receipt.browser if hasattr(receipt, "browser") else receipt.get("browser", {})
+                result.evidence = browser_block.get("evidence_refs", []) or []
             except Exception as exc:  # evidence must never break execution
                 logger.warning("evidence adapter failed: %s", exc, exc_info=True)
         return result
