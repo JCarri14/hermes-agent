@@ -192,6 +192,76 @@ def test_classify_replace_secret_live():
     assert v.cls == DESTRUCTIVE_LIVE
 
 
+# ─────────── LEXICAL_CONTEXT_FALSE_POSITIVE_V1 (v1.1) — fix classifier ──────────
+
+# Positive: contextual nouns must NOT be classified destructive-live.
+def test_contextual_noun_migration_program_is_safe():
+    v = _classify("ERP modular migration program", "Programa de migracion modular del ERP.")
+    assert v.cls == SAFE
+
+
+def test_contextual_noun_erp_integration_card_is_safe():
+    # The exact ERP M13-INTEGRATE card that triggered the false positive.
+    v = _classify(
+        "M13-INTEGRATE: integracion canonica Items tras PASES QA",
+        "migracion, prod, cloudflare, infra en el body de la card de orquestacion",
+    )
+    assert v.cls == SAFE
+
+
+def test_contextual_noun_ledger_reconciliation_is_safe():
+    v = _classify("Ledger reconciliation", "migration ledger reconciliation doc")
+    assert v.cls == SAFE
+
+
+def test_contextual_noun_cloudflare_design_is_safe():
+    v = _classify("Cloudflare integration design", "Cloudflare integration design doc")
+    assert v.cls == SAFE
+
+
+def test_contextual_noun_infra_considerations_is_safe():
+    v = _classify("Infra considerations", "infra considerations for the card")
+    assert v.cls == SAFE
+
+
+def test_completion_card_after_verified_push_is_safe():
+    v = _classify(
+        "Complete orchestration card after verified git push",
+        "Complete the orchestration card after the verified git push.",
+    )
+    assert v.cls == SAFE
+
+
+# Negative: actionable predicates over live resources STILL require a GO.
+def test_action_migrate_production_db_is_live():
+    v = _classify("migrate production database", "Migrate the production database to the new schema.")
+    assert v.cls == DESTRUCTIVE_LIVE
+
+
+def test_action_deploy_irreversible_migration_is_live():
+    v = _classify(
+        "deploy irreversible migration to production",
+        "Deploy the irreversible migration to production.",
+    )
+    assert v.cls == DESTRUCTIVE_LIVE
+
+
+def test_action_change_cloudflare_dns_is_live():
+    v = _classify("change Cloudflare production DNS", "Change the Cloudflare production DNS record.")
+    assert v.cls == DESTRUCTIVE_LIVE
+
+
+def test_action_erase_production_bucket_is_live():
+    # UNKNOWN verb + live marker is STILL fail-closed DESTRUCTIVE_LIVE.
+    v = _classify("erase production bucket", "Erase the production bucket to free space.")
+    assert v.cls == DESTRUCTIVE_LIVE
+
+
+def test_action_apply_terraform_production_is_live():
+    v = _classify("apply terraform production", "Apply terraform change to the production state.")
+    assert v.cls == DESTRUCTIVE_LIVE
+
+
 # ────────────────────────── v1.1 GO matcher (action_id) ───────────────────────
 
 
@@ -250,13 +320,13 @@ def test_declared_action_id_wins_over_derived_digest():
 
 
 def test_classify_unknown_destructive_verb_live_marker_blocks():
-    """Verbs outside DESTRUCTIVE_VERBS that act on a live INFRA resource must
-    NOT fall through to SAFE — UNKNOWN/ambiguity => DESTRUCTIVE_LIVE
-    (reproduces QA findings: erase/terminate/rm -rf were SAFE)."""
+    """Verbs outside DESTROY_VERBS that act on a live INFRA resource must NOT
+    fall through to SAFE — UNKNOWN action (actionable predicate + live marker)
+    => DESTRUCTIVE_LIVE (reproduces QA findings: erase/terminate/rm -rf)."""
     v1 = _classify("Erase the production bucket",
                    "Erase the R2 bucket erp-client-a-docs before migration.")
     assert v1.cls == DESTRUCTIVE_LIVE
-    assert "UNKNOWN => DESTRUCTIVE_LIVE" in "; ".join(v1.reasons)
+    assert "UNKNOWN action" in "; ".join(v1.reasons)
     v2 = _classify("Terminate the live R2 object storage",
                    "Terminate the live R2 object storage endpoint CLIENT_A.")
     assert v2.cls == DESTRUCTIVE_LIVE
@@ -265,12 +335,17 @@ def test_classify_unknown_destructive_verb_live_marker_blocks():
 
 
 def test_classify_infra_marker_without_verb_conservative():
-    """A live INFRA resource marker without any known destructive verb is
-    ambiguous => gated (conservative, fail-closed)."""
+    """A live INFRA marker WITHOUT an actionable predicate is contextual
+    (design/doc/program) and stays SAFE; WITH an actionable predicate it is
+    UNKNOWN action => DESTRUCTIVE_LIVE (fail-closed preserved)."""
     v = _classify("Update the production deployment",
                   "Update the production deployment notes and status page.")
     assert v.cls == DESTRUCTIVE_LIVE
-    assert "UNKNOWN => DESTRUCTIVE_LIVE" in "; ".join(v.reasons)
+    assert "UNKNOWN action" in "; ".join(v.reasons)
+    # contextual noun only -> SAFE (program/documentation naming infra vocab)
+    v2 = _classify("Production deployment guide",
+                   "Documentation for the production deployment notes.")
+    assert v2.cls == SAFE
 
 
 def test_classify_identity_marker_without_verb_is_safe():

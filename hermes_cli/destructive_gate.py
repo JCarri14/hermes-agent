@@ -271,6 +271,57 @@ def compile_allowlist(entries: Any) -> List[tuple[Pattern[str], str]]:
     return compiled
 
 
+# Actionable (non-destructive) predicates that turn a live-resource marker
+# into genuine UNKNOWN-action ambiguity. A bare contextual noun that merely
+# mentions infra vocabulary (program name, documentation, design) is NOT an
+# action: "ERP modular migration program" must stay SAFE, while
+# "migrate production database" / "deploy irreversible migration to
+# production" / "change Cloudflare production DNS" remain DESTRUCTIVE_LIVE.
+# Matched as whole tokens; conservative list (mutation verbs only — verbs
+# like "document", "review", "verify", "complete" are never listed here).
+_ACTION_PREDICATES = (
+    "migrate", "migrating", "migrated",
+    "deploy", "deploying", "deployed",
+    "apply", "applying", "applied",
+    "execute", "executing", "executed",
+    "run", "running", "perform",
+    "change", "changing", "changed",
+    "alter", "altering", "altered",
+    "set", "update", "updating", "updated",
+    "modify", "modifying", "modified",
+    "reconfigure", "reconfiguring", "reconfigured",
+    "move", "moving", "moved",
+    "transfer", "transferring", "transferred",
+    "rotate", "rotating", "rotated",
+    "restart", "restarting", "restarted",
+    "rollback", "rollbacking", "rolled back",
+    "downgrade", "downgrading", "downgraded",
+    "provision", "provisioning", "provisioned",
+    "reindex", "reindexing", "reindexed",
+    "rebuild", "rebuilding", "rebuilt",
+    "erase", "erasing", "erased",
+    # UNKNOWN-action predicates that CLEARLY intend destruction on live infra:
+    # terminate (instance/service) and shell rm -rf (recursive delete).
+    "terminate", "terminating", "terminated",
+    "rm -rf", "rm -r", "rm -f",
+    "enable", "disabling", "disable",
+)
+
+_ACTION_PRED_RE = _token_regex(_ACTION_PREDICATES)
+
+
+def _has_action_predicate(title: str, body: str) -> bool:
+    """True when the text contains an actionable mutation predicate.
+
+    Covers the UNKNOWN-action ambiguity case: a live-resource marker ONLY
+    becomes DESTRUCTIVE_LIVE when an actionable verb is also present, so a
+    contextual noun (program/doc/design mentioning infra vocabulary) is not
+    mistaken for destructive intent.
+    """
+    text = (title + "\n" + body).lower()
+    return _ACTION_PRED_RE.search(text) is not None
+
+
 def _classify(title: str, body: str, *, strict: bool = False) -> Verdict:
     """Classify a card as destructive-live or safe. Pure + deterministic.
 
@@ -297,14 +348,22 @@ def _classify(title: str, body: str, *, strict: bool = False) -> Verdict:
         reasons.append("destructive verb present but no live-resource marker")
         return Verdict(SAFE, reasons + ["not destructive-live"])
 
-    # No known destructive verb. A live INFRA marker without a matched verb
-    # is UNKNOWN/ambiguity => DESTRUCTIVE_LIVE (fail-closed, never guess SAFE).
-    if _has_infra_live_marker(title, body):
+    # No known destructive verb. A live INFRA marker WITHOUT an actionable
+    # predicate is CONTEXT (program name, docs, design) and stays SAFE.
+    # UNKNOWN-action ambiguity (actionable predicate + live marker) maps to
+    # DESTRUCTIVE_LIVE (fail-closed, never guess SAFE for a real action).
+    if _has_infra_live_marker(title, body) and _has_action_predicate(title, body):
         reasons.append(
-            "live-resource marker without known destructive verb "
-            "(UNKNOWN => DESTRUCTIVE_LIVE)"
+            "actionable predicate + live-resource marker, no destructive verb "
+            "(UNKNOWN action => DESTRUCTIVE_LIVE)"
         )
         return Verdict(DESTRUCTIVE_LIVE, reasons)
+    if _has_infra_live_marker(title, body):
+        reasons.append(
+            "live-resource marker without actionable predicate "
+            "(contextual noun only => SAFE)"
+        )
+        return Verdict(SAFE, reasons)
 
     return Verdict(SAFE, ["no destructive-live signal"])
 
