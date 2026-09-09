@@ -280,29 +280,31 @@ def compile_allowlist(entries: Any) -> List[tuple[Pattern[str], str]]:
 # Matched as whole tokens; conservative list (mutation verbs only — verbs
 # like "document", "review", "verify", "complete" are never listed here).
 _ACTION_PREDICATES = (
-    "migrate", "migrating", "migrated",
-    "deploy", "deploying", "deployed",
-    "apply", "applying", "applied",
-    "execute", "executing", "executed",
-    "run", "running", "perform",
-    "change", "changing", "changed",
-    "alter", "altering", "altered",
-    "set", "update", "updating", "updated",
-    "modify", "modifying", "modified",
-    "reconfigure", "reconfiguring", "reconfigured",
-    "move", "moving", "moved",
-    "transfer", "transferring", "transferred",
-    "rotate", "rotating", "rotated",
-    "restart", "restarting", "restarted",
-    "rollback", "rollbacking", "rolled back",
-    "downgrade", "downgrading", "downgraded",
-    "provision", "provisioning", "provisioned",
-    "reindex", "reindexing", "reindexed",
-    "rebuild", "rebuilding", "rebuilt",
-    "erase", "erasing", "erased",
+    "migrate", "migrating",
+    "deploy", "deploying",
+    "apply", "applying",
+    "execute", "executing",
+    # "run"/"running" removed: too broad — "run the tests on the migration
+    # branch" is NOT destructive. A genuinely destructive run has an explicit
+    # destructive verb (terraform destroy, rm -rf) caught by other branches.
+    "change", "changing",
+    "alter", "altering",
+    "set", "update", "updating",
+    "modify", "modifying",
+    "reconfigure", "reconfiguring",
+    "move", "moving",
+    "transfer", "transferring",
+    "rotate", "rotating",
+    "restart", "restarting",
+    "rollback", "rolling back", "rolled back",
+    "downgrade", "downgrading",
+    "provision", "provisioning",
+    "reindex", "reindexing",
+    "rebuild", "rebuilding",
+    "erase", "erasing",
     # UNKNOWN-action predicates that CLEARLY intend destruction on live infra:
     # terminate (instance/service) and shell rm -rf (recursive delete).
-    "terminate", "terminating", "terminated",
+    "terminate", "terminating",
     "rm -rf", "rm -r", "rm -f",
     "enable", "disabling", "disable",
 )
