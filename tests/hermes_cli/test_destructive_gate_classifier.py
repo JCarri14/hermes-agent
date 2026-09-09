@@ -263,6 +263,15 @@ def test_action_apply_terraform_production_is_live():
     assert v.cls == DESTRUCTIVE_LIVE
 
 
+def test_terraform_destroy_alone_is_live():
+    # GO case: "terraform destroy" without an explicit "live" in text is
+    # STILL destructive-live (terraform = live IaC state marker).
+    v = _classify("terraform destroy", "Run terraform destroy on the staging environment.")
+    assert v.cls == DESTRUCTIVE_LIVE
+    v2 = _classify("terraform state destroy", "terraform state destroy")
+    assert v2.cls == DESTRUCTIVE_LIVE
+
+
 # ────────────────────────── v1.1 GO matcher (action_id) ───────────────────────
 
 

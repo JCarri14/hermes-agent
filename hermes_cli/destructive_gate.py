@@ -137,6 +137,8 @@ LIVE_RESOURCE_MARKERS = (
     # deployment / service / infra
     "deployment", "service", "infra", "infrastructure",
     "cloudflare", "dns record", "route53",
+    # terraform manages live IaC state — "terraform destroy" is destructive-live
+    "terraform", "terraform state",
     # credentials / identity (only meaningful as a destructive target when a
     # destructive verb is present — the classifier requires both)
     "credential", "credentials", "secret", "secrets", "api key", "api keys",
@@ -164,6 +166,8 @@ _LIVE_INFRA_MARKERS = (
     # deployment / service / infra
     "deployment", "service", "infra", "infrastructure",
     "cloudflare", "dns record", "route53",
+    # terraform manages live IaC state — "terraform destroy" is destructive-live
+    "terraform", "terraform state",
 )
 
 # Explicit directive that overrides heuristics (any hit => DESTRUCTIVE_LIVE).
