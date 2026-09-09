@@ -296,8 +296,9 @@ _ACTION_PREDICATES = (
     "set", "update", "updating",
     "modify", "modifying",
     "reconfigure", "reconfiguring",
-    "move", "moving",
-    "transfer", "transferring",
+    # "move"/"transfer" deliberately NOT predicates: they are code-refactor
+    # verbs ("move these files into modules/") — never destructive by
+    # themselves. "move production database" is a data move, not a delete.
     "rotate", "rotating",
     "restart", "restarting",
     "rollback", "rolling back", "rolled back",
