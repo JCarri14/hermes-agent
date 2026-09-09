@@ -437,8 +437,8 @@ def _human_go_comment_bodies(conn, task_id, *, assignee: Optional[str] = None,
         return []
     out: List[str] = []
     for r in rows:
-        author = (r["author"] or "").strip()
-        body = (r["body"] or "").strip()
+        author = (_row_get(r, "author", 0) or "").strip()
+        body = (_row_get(r, "body", 1) or "").strip()
         if not _is_human_go(body, task_id):
             continue
         if not author:
@@ -455,6 +455,26 @@ def _human_go_comment_bodies(conn, task_id, *, assignee: Optional[str] = None,
             continue  # configured operator allowlist: unlisted author is not a human GO
         out.append(body)
     return out
+
+
+def _row_get(row, key: str, idx: int, default=None):
+    """Access a SELECT result row by key, falling back to positional index.
+
+    The gate is called from multiple surfaces: the dispatcher/claim path runs
+    against a connection with ``row_factory = sqlite3.Row``, but workers and
+    some CLI paths pass a plain tuple-returning connection. Never assume one
+    shape — a tuple ``row["title"]`` raises TypeError which, under the gate's
+    fail-safe, degrades EVERYTHING to DESTRUCTIVE_LIVE (block requires human
+    GO). Reading positionally when the row is not a mapping keeps the gate
+    deterministic on both shapes.
+    """
+    try:
+        return row[key]
+    except (TypeError, IndexError, KeyError):
+        try:
+            return row[idx]
+        except (TypeError, IndexError):
+            return default
 
 
 def destructive_gate_requires_go(conn, task_id, *, board=None, strict: bool = False, allowlist=None):
@@ -480,9 +500,9 @@ def destructive_gate_requires_go(conn, task_id, *, board=None, strict: bool = Fa
         return ("DESTRUCTIVE_LIVE", f"destructive_gate card lookup failed: {exc}")
     if row is None:
         return ("DESTRUCTIVE_LIVE", "destructive_gate card not found")
-    title = row["title"] or ""
-    body = row["body"] or ""
-    assignee = row["assignee"] or None
+    title = _row_get(row, "title", 0) or ""
+    body = _row_get(row, "body", 1) or ""
+    assignee = _row_get(row, "assignee", 2) or None
 
     go_comments = _human_go_comment_bodies(conn, task_id, assignee=assignee)
     try:
@@ -801,10 +821,10 @@ def _resolve_scope(conn, task_id: str, *, strict: bool, allowlist: Optional[Any]
         return {"error": _block("DESTRUCTIVE_LIVE", f"destructive_gate card lookup failed: {exc}")}
     if row is None:
         return {"error": _block("DESTRUCTIVE_LIVE", "destructive_gate card not found")}
-    title = row["title"] or ""
-    body = row["body"] or ""
-    tenant = (row["tenant"] or "").strip() or None
-    assignee = row["assignee"] or None
+    title = _row_get(row, "title", 0) or ""
+    body = _row_get(row, "body", 1) or ""
+    tenant = (_row_get(row, "tenant", 2) or "").strip() or None
+    assignee = _row_get(row, "assignee", 3) or None
     text = title + "\n" + body
     for pattern, reason in compile_allowlist(allowlist):
         if pattern.search(text):

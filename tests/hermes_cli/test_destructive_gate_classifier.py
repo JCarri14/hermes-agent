@@ -11,6 +11,7 @@ from hermes_cli.destructive_gate import (
     SAFE,
     GateInput,
     compile_allowlist,
+    destructive_gate_requires_go,
     evaluate,
     _classify,
     _go_precedes_run_start,
@@ -390,6 +391,36 @@ def test_author_allowed_by_allowlist_fail_closed():
 
 
 def test_go_precedes_run_start_ordering_fail_closed():
+
+    # ── row-shape robustness: the gate must work with BOTH sqlite3.Row
+    #    (dispatcher/claim path) and plain tuple rows (worker/CLI paths).
+    #    A tuple `row["title"]` used to raise TypeError which, under the
+    #    fail-safe, degraded EVERY card to DESTRUCTIVE_LIVE/block.
+    import sqlite3 as _sq
+
+    def _eval_with(conn):
+        return destructive_gate_requires_go(conn, "t_rowshape")
+
+    # tuple-returning connection (worker real path)
+    c1 = _sq.connect(":memory:")
+    c1.execute("CREATE TABLE tasks (id TEXT, title TEXT, body TEXT, tenant TEXT, assignee TEXT)")
+    c1.execute(
+        "INSERT INTO tasks VALUES ('t_rowshape','ERP migration program','context',NULL,NULL)"
+    )
+    c1.execute("CREATE TABLE task_comments (id INTEGER PRIMARY KEY, task_id TEXT, author TEXT, body TEXT)")
+    c1.commit()
+    assert _eval_with(c1) is None  # SAFE contextual noun -> allow
+
+    # row_factory=Row connection (dispatcher path)
+    c2 = _sq.connect(":memory:")
+    c2.row_factory = _sq.Row
+    c2.execute("CREATE TABLE tasks (id TEXT, title TEXT, body TEXT, tenant TEXT, assignee TEXT)")
+    c2.execute(
+        "INSERT INTO tasks VALUES ('t_rowshape','ERP migration program','context',NULL,NULL)"
+    )
+    c2.execute("CREATE TABLE task_comments (id INTEGER PRIMARY KEY, task_id TEXT, author TEXT, body TEXT)")
+    c2.commit()
+    assert _eval_with(c2) is None
     """HIGH-2 pure ordering: GO must be at-or-before the run start; missing
     either timestamp (incl. zero) is fail-closed."""
     ok, why = _go_precedes_run_start(100, 200)
