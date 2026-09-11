@@ -447,3 +447,81 @@ def test_go_precedes_run_start_ordering_fail_closed():
     assert ok is False and "missing" in why
     ok, why = _go_precedes_run_start(100, 0)
     assert ok is False and "missing" in why
+
+
+# ───────────────── D5-F2: human-delegated UNKNOWN action => SAFE ─────────────────
+# Regresión: una card ADMINISTRATIVA de pipeline (PR human-gated, NO auto-merge,
+# preparación sin ejecutar) NO debe clasificarse DESTRUCTIVE_LIVE por la mera
+# presencia de verbos de pipeline (merge/deploy/apply) + live marker, cuando la
+# card declara explícitamente que la acción la ejecuta un humano. Los verbos
+# destructivos REALES (delete/drop/destroy/...) se evalúan antes y NUNCA se
+# degradan (adversariales abajo).
+
+
+def test_admin_completion_with_human_delegation_is_safe():
+    v = _classify(
+        "G3-IMPL fix snapshot durable + copy 503 (codigo+tests, PR-READY, sin merge)",
+        "GATE 3 fix snapshot durable. Merge = humano (AGENTS.md), NO auto-merge. "
+        "CIERRE kanban_comment + block review-required. NO merge (human-gated).",
+    )
+    assert v.cls == SAFE, v.reasons
+
+
+def test_prep_card_no_execution_is_safe():
+    v = _classify(
+        "G1-PREP runbook + systemd unit template + entrypoint executor WSL",
+        "Esta card produce SOLO material preparatorio reversible, SIN ejecutar NADA: "
+        "no activar systemd, no crear infra, no deploy. reporta a Admin (sin merge, human-gated).",
+    )
+    assert v.cls == SAFE, v.reasons
+
+
+def test_rebase_verification_no_production_is_safe():
+    v = _classify(
+        "D5-F1 REBASE_DESTRUCTIVE_GATE_V1_2",
+        "NO deploy, NO activar flag, NO produccion. Solo rebase + verificacion.",
+    )
+    assert v.cls == SAFE, v.reasons
+
+
+def test_deploy_migration_prod_without_delegation_still_destructive():
+    # Sin señal de delegación a humano: deploy/apply a producción SIGUE fail-closed.
+    v = _classify(
+        "Deploy migration to production",
+        "apply the migration to the production database now, no gates",
+    )
+    assert v.cls == DESTRUCTIVE_LIVE, v.reasons
+
+
+def test_drop_prod_still_destructive_even_with_go_word():
+    # El verbo destructivo real se evalúa ANTES que la delegación: nunca se degrada.
+    v = _classify(
+        "Drop production database after human GO",
+        "the migration drops the prod database tables; requires human go",
+    )
+    assert v.cls == DESTRUCTIVE_LIVE, v.reasons
+
+
+def test_teardown_tenant_still_destructive():
+    v = _classify(
+        "Teardown live tenant jcdisseny",
+        "erase tenant jcdisseny from live environment, requires human approval",
+    )
+    assert v.cls == DESTRUCTIVE_LIVE, v.reasons
+
+
+def test_delete_bucket_still_destructive():
+    v = _classify(
+        "Delete r2 bucket",
+        "cleanup the bucket with destructive_action directive",
+    )
+    assert v.cls == DESTRUCTIVE_LIVE, v.reasons
+
+
+def test_rm_rf_still_destructive():
+    v = _classify(
+        "rm -rf the live bucket",
+        "remove recursive the object storage",
+    )
+    assert v.cls == DESTRUCTIVE_LIVE, v.reasons
+

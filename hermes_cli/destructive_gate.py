@@ -316,6 +316,41 @@ _ACTION_PREDICATES = (
 
 _ACTION_PRED_RE = _token_regex(_ACTION_PREDICATES)
 
+# Señales de que una acción de pipeline (deploy/merge/apply/...) está DELEGADA
+# a un humano y NO se ejecutará por el dispatcher/worker en este dispatch.
+# Un verbo "deploy/merge/apply" condicionado a un gate humano NO es una
+# UNKNOWN-action autónoma ambigua: la card declara explícitamente que la
+# mutación la hará un humano (p.ej. PR human-gated, "_GO_ a merge"). Sin esta
+# señal, deploy/merge sobre prod/main SINGO sigue siendo DESTRUCTIVE_LIVE
+# (fail-closed). Nunca se listan aquí verbos destructivos reales: una card que
+# diga "teardown live tenant tras GO" sigue DESTRUCTIVE_LIVE (el verbo
+# destructivo se evalúa ANTES, en _VERB_RE).
+_HUMAN_DELEGATION_MARKERS = (
+    "human-gated", "human gate", "human gated", "human-gate",
+    "human required", "human required)", "human_req",
+    "no auto-merge", "no auto merge", "no automerge",
+    "no auto-deploy", "no auto deploy",
+    "sin merge", "sin auto-merge", "no merge", "not merged",
+    "merge humano", "human merge", "merge por humano",
+    "sera mergeado por", "sera el humano", "lo mergea un humano",
+    "a human", "human approval", "human review",
+    "human-gate", "gate humano", "puerta humana",
+    "pr- ready", "pr ready", "pr_ready", "listo para review",
+    "espera a que", "al volver", "cuando vuelva",
+    "requires human", "requiere humano", "requiere go",
+    "go explicito", "go explicito", "go humano", "human go",
+    "con tu go", "con su go",
+    "no autorizado", "not authorized",
+    "tras pass", "tras qa", "after pass", "after qa",
+    "cuando pase", "si pasa", "fuera de alcance",
+    "quedara pendiente", "queda pendiente", "pendiente de",
+    "no se ejecuta", "no ejecutar", "sin ejecutar",
+    "no deploy", "no se autojecuta", "no se autoejecuta",
+    "manualmente", "manual", "por el operador", "del operador",
+)  # type: tuple[str, ...]
+
+_HUMAN_DELEG_RE = _token_regex(_HUMAN_DELEGATION_MARKERS)
+
 
 def _has_action_predicate(title: str, body: str) -> bool:
     """True when the text contains an actionable mutation predicate.
@@ -327,6 +362,21 @@ def _has_action_predicate(title: str, body: str) -> bool:
     """
     text = (title + "\n" + body).lower()
     return _ACTION_PRED_RE.search(text) is not None
+
+
+def _action_delegated_to_human(title: str, body: str) -> bool:
+    """True when the card explicitly delegates the cautious action to a human.
+
+    Used ONLY for the UNKNOWN-action branch (actionable predicate + live
+    marker, no destructive verb). If the card says the merge/deploy/apply is
+    human-gated / NO auto-merge / pending human, the dispatcher is NOT going
+    to perform the mutation autonomously, so "UNKNOWN autonomous action =>
+    DESTRUCTIVE_LIVE" does not apply: the action is explicitly out of the
+    worker's authority. Real destructive verbs are evaluated earlier and are
+    never downgraded by this helper.
+    """
+    text = (title + "\n" + body).lower()
+    return _HUMAN_DELEG_RE.search(text) is not None
 
 
 def _classify(title: str, body: str, *, strict: bool = False) -> Verdict:
@@ -358,8 +408,20 @@ def _classify(title: str, body: str, *, strict: bool = False) -> Verdict:
     # No known destructive verb. A live INFRA marker WITHOUT an actionable
     # predicate is CONTEXT (program name, docs, design) and stays SAFE.
     # UNKNOWN-action ambiguity (actionable predicate + live marker) maps to
-    # DESTRUCTIVE_LIVE (fail-closed, never guess SAFE for a real action).
+    # DESTRUCTIVE_LIVE (fail-closed, never guess SAFE for a real action),
+    # UNLESS the card explicitly delegates that action to a human (PR
+    # human-gated, NO auto-merge, merge pending human review, etc.): then the
+    # dispatcher will NOT perform the mutation autonomously and the
+    # UNKNOWN-action ambiguity does not apply. Real destructive verbs
+    # (delete/drop/destroy/...) are evaluated in _VERB_RE above and are NEVER
+    # downgraded by this branch.
     if _has_infra_live_marker(title, body) and _has_action_predicate(title, body):
+        if _action_delegated_to_human(title, body):
+            reasons.append(
+                "actionable predicate + live-resource marker, but action "
+                "explicitly delegated to human (human-gated/no auto-merge) => SAFE"
+            )
+            return Verdict(SAFE, reasons)
         reasons.append(
             "actionable predicate + live-resource marker, no destructive verb "
             "(UNKNOWN action => DESTRUCTIVE_LIVE)"
