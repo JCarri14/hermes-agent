@@ -524,4 +524,3 @@ def test_rm_rf_still_destructive():
         "remove recursive the object storage",
     )
     assert v.cls == DESTRUCTIVE_LIVE, v.reasons
-
