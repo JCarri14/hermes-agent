@@ -127,7 +127,13 @@ def test_complete_happy_path(worker_env):
         run = kb.latest_run(conn, worker_env)
         assert run.outcome == "completed"
         assert run.summary == "got the thing done"
-        assert run.metadata == {"files": 2}
+        assert run.metadata is not None
+        # The closing run keeps the worker's handoff metadata AND preserves
+        # forensic claim identity (prev_worker_pid / prev_claim_lock) that
+        # _end_run captures before nulling the live claim columns (D4 C4).
+        assert isinstance(run.metadata, dict)
+        assert {"files": 2}.items() <= run.metadata.items()
+        assert "prev_claim_lock" in run.metadata
     finally:
         conn.close()
 
@@ -530,7 +536,11 @@ def test_worker_lifecycle_through_tools(worker_env):
         assert parent.current_run_id is None
         run = kb.latest_run(conn, worker_env)
         assert run.outcome == "completed"
-        assert run.metadata == {"child_task": child_out["task_id"]}
+        assert run.metadata is not None
+        # Same enrichment contract as test_complete_happy_path: handoff
+        # metadata is preserved; forensic claim keys ride along.
+        assert {"child_task": child_out["task_id"]}.items() <= run.metadata.items()
+        assert "prev_claim_lock" in run.metadata
         # Child is todo (parent just finished, but recompute_ready may
         # have promoted it — complete_task runs recompute internally).
         child = kb.get_task(conn, child_out["task_id"])
