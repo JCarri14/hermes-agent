@@ -812,6 +812,16 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
 
     real_pdf = tmp_path / "real.pdf"
     real_pdf.write_bytes(b"%PDF-fake")
+    # Second artifact that ALSO exists at completion time: the fork's
+    # deterministic persistence gate (tools/kanban_tools.py, P0 fail-closed)
+    # rejects kanban_complete when any declared artifact is missing. Upstream's
+    # original scenario declared a ghost path at completion — stale semantics
+    # after the gate. Here both artifacts exist at complete; the second one
+    # disappears AFTER completion and BEFORE the notifier's delivery tick,
+    # which is the exact window _deliver_kanban_artifacts must degrade
+    # gracefully in (skip missing, deliver the rest).
+    ghost_pdf = tmp_path / "ghost.pdf"
+    ghost_pdf.write_bytes(b"%PDF-fake")
 
     conn = kb.connect()
     try:
@@ -825,10 +835,26 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     try:
         kt._handle_complete({
             "summary": "one real, one ghost",
-            "artifacts": [str(real_pdf), "/tmp/definitely-does-not-exist.pdf"],
+            "artifacts": [str(real_pdf), str(ghost_pdf)],
         })
     finally:
         os.environ.pop("HERMES_KANBAN_TASK", None)
+
+    # Ordering proof (deterministic, no timing guesses): the completed event
+    # must be persisted while BOTH artifacts still exist...
+    with kb.connect() as conn:
+        kinds = [
+            row[0]
+            for row in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id=? ORDER BY id",
+                (tid,),
+            )
+        ]
+    assert "completed" in kinds, f"no completed event persisted: {kinds}"
+    # ...and only THEN (before the notifier runs) does the artifact vanish.
+    # The delete happens in THIS test thread ahead of the watcher being
+    # started, so there is no filesystem-vs-delivery race.
+    ghost_pdf.unlink()
 
     runner = object.__new__(GatewayRunner)
     runner._owns_kanban_dispatcher_lock = lambda: True
