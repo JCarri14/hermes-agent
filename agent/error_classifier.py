@@ -939,6 +939,26 @@ def classify_api_error(
         )
         return _result(reason, **plugin_classification)
 
+    # ── 0.5 Codex quota/rate-limit AuthError → rate_limit (connector) ──
+    # Codex upstream quota (HTTP 429) surfaces as AuthError(code=CODEX_RATE_LIMITED_CODE)
+    # (hermes_cli/auth.py:986,1006-1018).  The predicate is only consumed by
+    # auth.py:1041 and gateway/run.py today — NOT by the interactive
+    # classifier/loop — and AuthError carries no ``status_code``, so these
+    # failures used to land on message-matching heuristics and did not
+    # reliably engage the session fallback chain.  Classifying by the
+    # explicit code makes the decision deterministic (transient, not a
+    # credential failure) and routes it through the same rate-limit gate the
+    # loop already applies to any other 429 (#INTERACTIVE_SESSION_FALLBACK_V1).
+    # Lazy import: hermes_cli.auth imports agent modules at module level
+    # (auth.py:53), so a module-level import here would risk a cycle — same
+    # pattern as auth.py:913.
+    try:
+        from hermes_cli.auth import is_rate_limited_auth_error
+        if is_rate_limited_auth_error(error):
+            return _result(FailoverReason.rate_limit, retryable=True, should_fallback=True)
+    except Exception:
+        pass  # auth unavailable → degrade to existing classification
+
     # ── 1. Provider-specific patterns (highest priority) ────────────
 
     # Provider content-policy / safety-filter block. The provider has made a

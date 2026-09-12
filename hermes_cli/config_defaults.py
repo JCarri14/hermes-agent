@@ -8,6 +8,23 @@ DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
     "fallback_providers": [],
+    # INTERACTIVE_SESSION_FALLBACK_V1 — session-level provider fallback route.
+    # NOT ``fallback_providers``: the native chain list stays untouched; this
+    # block only decides WHICH chain the interactive session loop seeds
+    # (hermes_cli/interactive_fallback.py.build_session_fallback_chain). When
+    # ``providers`` is empty (default), the legacy fallback_providers chain is
+    # used exactly as before — the feature is opt-in per profile config.
+    "interactive_session_fallback": {
+        # Master switch; env HERMES_INTERACTIVE_FALLBACK=0 disables.
+        "enabled": True,
+        # Optional explicit session route, e.g.:
+        #   - provider: anthropic
+        #     model: claude-sonnet-4
+        #   - provider: openrouter
+        #     model: deepseek/deepseek-v4-flash-0731
+        # (model slug to be verified live in IS-CANARY, design O2).
+        "providers": [],
+    },
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
     # SQLite journal mode used by every Hermes database opener. WAL is the

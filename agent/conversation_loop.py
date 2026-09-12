@@ -1575,6 +1575,64 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     return sp
 
 
+def _try_emit_session_fallback_notice(
+    agent, classified, from_provider, from_model, *, turn_id,
+) -> None:
+    """Best-effort post-activation hook (INTERACTIVE_SESSION_FALLBACK_V1).
+
+    After ``try_activate_fallback`` has swapped the provider in place, emit the
+    brief session UX notice (``format_session_fallback_notice``) and the
+    structured ``[session-fallback]`` telemetry line — ONLY when the activated
+    chain entry came from the explicit interactive-session route
+    (``interactive_session_fallback.providers`` / env override, marked
+    ``_session_explicit_route`` by ``hermes_cli.interactive_fallback``).
+    Legacy ``fallback_providers`` chains keep the native buffer strings above
+    untouched.
+
+    Purely additive and inert: any failure here degrades silently to the
+    native status lines the loop already printed.
+    """
+    try:
+        from hermes_cli.interactive_fallback import (
+            format_session_fallback_notice,
+            is_qualifying_provider_failure,
+            record_session_fallback,
+        )
+        if not is_qualifying_provider_failure(classified):
+            return
+        _reason = getattr(classified, "reason", None)
+        if _reason is None:
+            return
+        _chain = getattr(agent, "_fallback_chain", None) or []
+        _index = (getattr(agent, "_fallback_index", 0) or 0) - 1  # activated entry
+        _entry = _chain[_index] if 0 <= _index < len(_chain) else None
+        if _entry is None or _entry.get("_session_explicit_route") is not True:
+            return
+        _to_provider = str(_entry.get("provider") or "")
+        _to_model = str(_entry.get("model") or "")
+        if not _to_provider or not _to_model:
+            return
+        _from_provider = str(from_provider or "")
+        _from_model = str(from_model or "")
+        _notice = format_session_fallback_notice(
+            f"{_from_provider}/{_from_model}".strip("/"),
+            f"{_to_provider}/{_to_model}",
+        )
+        _buffer_status = getattr(agent, "_buffer_status", None)
+        if callable(_buffer_status):
+            _buffer_status(_notice)
+        record_session_fallback(
+            turn_id=turn_id,
+            from_provider=_from_provider,
+            from_model=_from_model,
+            to_provider=_to_provider,
+            to_model=_to_model,
+            reason=_reason.value if hasattr(_reason, "value") else str(_reason),
+        )
+    except Exception:
+        pass  # observability must never affect the turn
+
+
 def _ensure_cached_system_prompt_static(agent, system_message=None) -> None:
     """Rebuild ``_cached_system_prompt_static`` when caching becomes active.
 
@@ -5522,7 +5580,15 @@ def run_conversation(
                             )
                         else:
                             agent._buffer_status("⚠️ Rate limited — switching to fallback provider...")
+                        _session_fb_from_provider = getattr(agent, "provider", "") or ""
+                        _session_fb_from_model = getattr(agent, "model", "") or ""
                         if agent._try_activate_fallback(reason=classified.reason):
+                            # Session-route observability (additive, best-effort).
+                            _try_emit_session_fallback_notice(
+                                agent, classified,
+                                _session_fb_from_provider, _session_fb_from_model,
+                                turn_id=turn_id,
+                            )
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0

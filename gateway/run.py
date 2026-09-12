@@ -68,6 +68,7 @@ from agent.turn_context import (
 )
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
+from hermes_cli.interactive_fallback import build_session_fallback_chain
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -10071,7 +10072,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return None
 
     def _refresh_fallback_model(self) -> list | None:
-        """Re-read fallback_providers from disk for the next agent create/reuse.
+        """Re-read the session fallback chain (interactive_session_fallback /
+        fallback_providers) from disk for the next agent create/reuse.
 
         Cron already does this per job via ``get_fallback_chain``; the gateway
         previously froze ``self._fallback_model`` at process start, so a chain
@@ -10114,7 +10116,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "keeping last known-good chain", exc_info=True,
             )
             return self._fallback_model
-        self._fallback_model = get_fallback_chain(cfg) or None
+        self._fallback_model = build_session_fallback_chain(cfg) or None
         return self._fallback_model
 
     @staticmethod
