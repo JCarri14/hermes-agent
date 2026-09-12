@@ -95,7 +95,10 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
     assert requested.payload["summary"] == "Implementation and focused tests are ready."
     implementation_run = _run(kb.list_runs(conn, task_id), "review_requested")
     assert implementation_run.summary == "Implementation and focused tests are ready."
-    assert implementation_run.metadata == {"commit": "abc123"}
+    assert implementation_run.metadata is not None
+    # Worker handoff metadata is preserved; the closing run may carry
+    # forensic claim identity (D4 C4) in addition.
+    assert {"commit": "abc123"}.items() <= implementation_run.metadata.items()
 
     review = kb.claim_review_task(conn, task_id, claimer="reviewer:1")
     assert review is not None
