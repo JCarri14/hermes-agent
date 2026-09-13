@@ -337,6 +337,7 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
     import hermes_cli.kanban_db as _kb
 
     monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    monkeypatch.setenv("HERMES_KANBAN_EXECUTOR_FALLBACK", "0")
     now = 5_000_000
 
     with kb.connect() as conn:
@@ -365,6 +366,478 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         # though last_failure_error contains "rate-limited".
         monkeypatch.setattr(_kb.time, "time", lambda: now + 400)
         assert kb.check_respawn_guard(conn, tid) is None
+
+
+def _latest_event_payload(conn, task_id: str, kind: str) -> dict:
+    import json
+
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind=? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, kind),
+    ).fetchone()
+    assert row is not None
+    return json.loads(row["payload"] or "{}")
+
+
+def _run_metadata(conn, run_id: int) -> dict:
+    import json
+
+    row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id=?", (run_id,),
+    ).fetchone()
+    assert row is not None
+    return json.loads(row["metadata"] or "{}")
+
+
+def test_rate_limit_exit_queues_claude_fallback_attempt_and_bypasses_cooldown(
+    kanban_home, monkeypatch, tmp_path,
+):
+    """A provider quota wall should reroute the same card to ``claude -p``.
+
+    The old behaviour left the task in ``ready`` behind the rate-limit
+    cooldown. With executor fallback enabled, the cooldown must not block the
+    next *fallback* attempt, and the new run must have distinct attempt
+    identity rather than pretending the original model changed.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    workspace = tmp_path / "empty-workspace"
+    workspace.mkdir()
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(
+            conn,
+            title="fallback canary",
+            assignee="developer",
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+        )
+        claimed = kb.claim_task(conn, tid, claimer=f"{host}:openai")
+        failed_run_id = claimed.current_run_id
+        kb._set_worker_pid(conn, tid, 71001)
+        _kb._record_worker_exit(
+            71001, _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE),
+        )
+
+        crashed = kb.detect_crashed_workers(conn)
+
+        assert crashed == []
+        assert getattr(_kb.detect_crashed_workers, "_last_rate_limited", []) == [tid]
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 0
+        payload = _latest_event_payload(conn, tid, "executor_fallback_queued")
+        assert payload["fallback_from"] == failed_run_id
+        assert payload["fallback_reason"] == "provider_quota_exhausted"
+        assert payload["next_executor"] == "claude-p"
+        assert payload["attempt_number"] == 2
+        assert payload["worktree_handoff"] == "NO_MUTATION"
+        assert kb.check_respawn_guard(conn, tid) is None
+
+        fallback_claim = kb.claim_task(conn, tid, claimer=f"{host}:claude")
+        assert fallback_claim is not None
+        metadata = _run_metadata(conn, fallback_claim.current_run_id)
+        assert metadata["attempt_number"] == 2
+        assert metadata["requested_executor"] == "claude-p"
+        assert metadata["actual_executor"] == "claude-p"
+        assert metadata["fallback_from"] == failed_run_id
+        assert metadata["fallback_reason"] == "provider_quota_exhausted"
+        assert metadata["profile"] == "developer"
+
+
+def test_nonzero_task_failure_does_not_queue_executor_fallback(
+    kanban_home, monkeypatch,
+):
+    """Task/process failures are not provider unavailability and must not reroute."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="real crash", assignee="developer")
+        kb.claim_task(conn, tid, claimer=f"{host}:worker")
+        kb._set_worker_pid(conn, tid, 71002)
+        _kb._record_worker_exit(71002, _exited_status(1))
+
+        crashed = kb.detect_crashed_workers(conn)
+
+        assert crashed == [tid]
+        row = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id=? "
+            "AND kind='executor_fallback_queued'",
+            (tid,),
+        ).fetchone()
+        assert row is None
+
+
+def test_claude_qualifying_failure_queues_explicit_lower_fallback(
+    kanban_home, monkeypatch, tmp_path,
+):
+    """Only after Claude has been attempted may the dispatcher select the lower fallback."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(
+            conn,
+            title="fallback chain",
+            assignee="developer",
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+        )
+        first = kb.claim_task(conn, tid, claimer=f"{host}:openai")
+        kb._set_worker_pid(conn, tid, 71003)
+        _kb._record_worker_exit(
+            71003, _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE),
+        )
+        kb.detect_crashed_workers(conn)
+        second = kb.claim_task(conn, tid, claimer=f"{host}:claude")
+        kb._set_worker_pid(conn, tid, 71004)
+        _kb._record_worker_exit(
+            71004, _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE),
+        )
+
+        kb.detect_crashed_workers(conn)
+
+        payload = _latest_event_payload(conn, tid, "executor_fallback_queued")
+        assert payload["fallback_from"] == second.current_run_id
+        assert payload["fallback_reason"] == "claude_unavailable"
+        assert payload["next_executor"] == "hermes-lower-fallback"
+        assert payload["attempt_number"] == 3
+        third = kb.claim_task(conn, tid, claimer=f"{host}:lower")
+        metadata = _run_metadata(conn, third.current_run_id)
+        assert metadata["attempt_number"] == 3
+        assert metadata["requested_executor"] == "hermes-lower-fallback"
+        assert metadata["requested_provider"] == "openrouter"
+        assert metadata["requested_model"] == "deepseek/deepseek-v4-flash-0731"
+        assert metadata["fallback_from"] == second.current_run_id
+        assert first.current_run_id != second.current_run_id != third.current_run_id
+
+
+def test_explicit_gpt56_task_falls_to_claude_not_gpt55(
+    kanban_home, monkeypatch, tmp_path,
+):
+    """An explicit high-complexity model override must not silently downgrade."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    workspace = tmp_path / "ws56"
+    workspace.mkdir()
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(
+            conn,
+            title="explicit complex task",
+            assignee="architect",
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+            model_override="gpt-5.6",
+            provider_override="openai-codex",
+        )
+        first = kb.claim_task(conn, tid, claimer=f"{host}:openai")
+        first_meta = _run_metadata(conn, first.current_run_id)
+        assert first_meta["requested_model"] == "gpt-5.6"
+        assert first_meta["requested_provider"] == "openai-codex"
+        assert first_meta["requested_executor"] == "hermes-profile"
+
+        kb._set_worker_pid(conn, tid, 71005)
+        _kb._record_worker_exit(
+            71005, _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE),
+        )
+        kb.detect_crashed_workers(conn)
+
+        payload = _latest_event_payload(conn, tid, "executor_fallback_queued")
+        assert payload["next_executor"] == "claude-p"
+        assert payload.get("requested_model") != "gpt-5.5"
+        second = kb.claim_task(conn, tid, claimer=f"{host}:claude")
+        second_meta = _run_metadata(conn, second.current_run_id)
+        assert second_meta["requested_executor"] == "claude-p"
+        assert second_meta.get("requested_model") != "gpt-5.5"
+
+
+def test_dispatch_once_respawns_rate_limited_card_as_claude_fallback(
+    kanban_home, monkeypatch, tmp_path, all_assignees_spawnable,
+):
+    """End-to-end dispatcher tick: quota wall -> fallback queued -> the SAME
+    card (never a shadow card) is re-dispatched to the fallback executor on the
+    next tick, consuming exactly one fallback attempt (guard returns None)."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "999999")
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_HOME", str(kanban_home))
+    workspace = tmp_path / "ws-e2e"
+    workspace.mkdir()
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(
+            conn,
+            title="e2e fallback",
+            assignee="alice",
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+        )
+        kb.claim_task(conn, tid, claimer=f"{host}:openai")
+        kb._set_worker_pid(conn, tid, 71006)
+        _kb._record_worker_exit(
+            71006, _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE),
+        )
+
+        res = kb.dispatch_once(conn, spawn_fn=lambda task, ws, board=None: 72001)
+
+        # Fallback queued + same card respawned, not a duplicate card.
+        assert res.rate_limited == [tid]
+        payload = _latest_event_payload(conn, tid, "executor_fallback_queued")
+        assert payload["next_executor"] == "claude-p"
+        assert res.spawned == [(tid, "alice", str(workspace))]
+        task = kb.get_task(conn, tid)
+        assert task.status == "running"
+        assert task.current_run_id is not None
+        meta = _run_metadata(conn, task.current_run_id)
+        assert meta["attempt_number"] == 2
+        assert meta["requested_executor"] == "claude-p"
+        assert meta["fallback_reason"] == "provider_quota_exhausted"
+        board_tasks = [
+            r["id"] for r in conn.execute("SELECT id FROM tasks", ()).fetchall()
+        ]
+        assert board_tasks.count(tid) == 1
+        # Exactly one queued-fallback event.
+        rows = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events WHERE task_id=? "
+            "AND kind='executor_fallback_queued'",
+            (tid,),
+        ).fetchone()
+        assert rows["n"] == 1
+
+
+class _FakePopen:
+    instances: list = []
+
+    def __init__(self, cmd, **kwargs):
+        self.cmd = cmd
+        self.kwargs = kwargs
+        self.pid = 73331
+        _FakePopen.instances.append(self)
+
+
+def test_fallback_aware_spawn_claude_uses_wrapper(kanban_home, tmp_path, monkeypatch):
+    """A claude-p fallback claim must spawn the claude wrapper module, not the
+    Hermes chat worker (which would just retry OpenAI)."""
+    import hermes_cli.kanban_db as _kb
+
+    _FakePopen.instances = []
+    monkeypatch.setattr(_kb.subprocess, "Popen", _FakePopen)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(
+            conn, title="wrapper route", assignee="alice",
+            workspace_kind="dir", workspace_path=str(workspace),
+        )
+        # Attempt 1 fails with quota; the fallback queue is recorded.
+        kb.claim_task(conn, tid, claimer=f"{host}:openai")
+        kb._end_run(conn, tid, outcome="rate_limited", error="quota")
+        kb._append_event(
+            conn, tid, "executor_fallback_queued",
+            {"next_executor": "claude-p", "attempt_number": 2, "fallback_from": 1},
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, "
+            "worker_pid=NULL, current_run_id=NULL WHERE id=?", (tid,),
+        )
+        conn.commit()
+        # The fallback attempt is claimed (writes the fallback plan into the
+        # run metadata) and then spawned — how the dispatcher actually runs.
+        fallback_claim = kb.claim_task(conn, tid, claimer=f"{host}:claude")
+        assert fallback_claim is not None
+        task = kb.get_task(conn, tid)
+
+    pid = _kb._fallback_aware_spawn(task, str(workspace), board="default")
+    assert pid == 73331
+    assert _FakePopen.instances, "Popen was never called"
+    popen = _FakePopen.instances[-1]
+    assert popen.cmd[0] == sys.executable
+    assert "-m" in popen.cmd
+    assert "hermes_cli.kanban_executor_fallback" in popen.cmd
+    assert popen.kwargs["env"]["HERMES_KANBAN_TASK"] == tid
+
+
+def test_fallback_aware_spawn_lower_uses_hermes_with_override(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """The lower fallback stays a Hermes worker but with the explicit
+    openrouter/deepseek route pinned via -m/--provider — never the profile's
+    OpenAI default and never fallback_providers."""
+    import hermes_cli.kanban_db as _kb
+
+    called = {}
+    monkeypatch.setenv("HERMES_KANBAN_EXECUTOR_LOWER_PROVIDER", "openrouter")
+    monkeypatch.setenv("HERMES_KANBAN_EXECUTOR_LOWER_MODEL", "deepseek/deepseek-v4-flash-0731")
+
+    def _fake_default_spawn(task, workspace, *, board=None):
+        called["task"] = task
+        called["workspace"] = workspace
+        return 73332
+
+    monkeypatch.setattr(_kb, "_default_spawn", _fake_default_spawn)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(
+            conn, title="lower route", assignee="alice",
+            workspace_kind="dir", workspace_path=str(workspace),
+        )
+        kb.claim_task(conn, tid, claimer=f"{host}:openai")
+        kb._end_run(conn, tid, outcome="rate_limited", error="quota")
+        kb._append_event(
+            conn, tid, "executor_fallback_queued",
+            {"next_executor": "claude-p", "attempt_number": 2, "fallback_from": 1},
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, "
+            "worker_pid=NULL, current_run_id=NULL WHERE id=?", (tid,),
+        )
+        conn.commit()
+        # Claude fails too; the chain advances to the lower fallback, which is
+        # then claimed and spawned.
+        kb.claim_task(conn, tid, claimer=f"{host}:claude")
+        kb._end_run(conn, tid, outcome="rate_limited", error="claude quota")
+        kb._append_event(
+            conn, tid, "executor_fallback_queued",
+            {"next_executor": "hermes-lower-fallback", "attempt_number": 3,
+             "fallback_from": 2},
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, "
+            "worker_pid=NULL, current_run_id=NULL WHERE id=?", (tid,),
+        )
+        conn.commit()
+        assert kb.claim_task(conn, tid, claimer=f"{host}:lower") is not None
+        task = kb.get_task(conn, tid)
+
+    pid = _kb._fallback_aware_spawn(task, str(workspace), board="default")
+    assert pid == 73332
+    assert called["task"].model_override == "deepseek/deepseek-v4-flash-0731"
+    assert called["task"].provider_override == "openrouter"
+
+
+def test_fallback_aware_spawn_default_without_pending(kanban_home, tmp_path, monkeypatch):
+    """No pending fallback -> plain Hermes worker. _fallback_aware_spawn is the
+    new default, so this is the hot path for every normal card."""
+    import hermes_cli.kanban_db as _kb
+
+    called = {}
+
+    def _fake_default_spawn(task, ws, *, board=None):
+        called["n"] = called.get("n", 0) + 1
+        return 73333
+
+    monkeypatch.setattr(_kb, "_default_spawn", _fake_default_spawn)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="plain", assignee="alice",
+            workspace_kind="dir", workspace_path=str(workspace),
+        )
+        kb.claim_task(conn, tid)
+        task = kb.get_task(conn, tid)
+
+    pid = _kb._fallback_aware_spawn(task, str(workspace), board="default")
+    assert pid == 73333
+    assert called["n"] == 1
+
+
+def test_dispatch_once_real_default_spawn_routes_fallback_card_to_wrapper(
+    kanban_home, monkeypatch, tmp_path, all_assignees_spawnable,
+):
+    """REGRESSION (QA finding): with the REAL default spawn (spawn_fn=None),
+    a ready-lane card with a pending claude-p fallback must be spawned through
+    the claude wrapper — NOT through the plain Hermes worker that would retry
+    the same failed OpenAI provider. The previous wiring only patched the
+    review lane, and the e2e test masked this by passing an explicit
+    spawn_fn."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    called: dict = {}
+
+    def _fake_wrapper(task, workspace, *, board=None):
+        called["task"] = task
+        called["workspace"] = workspace
+        return 74444
+
+    monkeypatch.setattr(_kb, "_spawn_claude_fallback_wrapper", _fake_wrapper)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="real-default route", assignee="alice",
+            workspace_kind="dir", workspace_path=str(workspace),
+        )
+        kb.claim_task(conn, tid)
+        kb._end_run(conn, tid, outcome="rate_limited", error="quota")
+        kb._append_event(
+            conn, tid, "executor_fallback_queued",
+            {"next_executor": "claude-p", "attempt_number": 2, "fallback_from": 1},
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, "
+            "worker_pid=NULL, current_run_id=NULL WHERE id=?", (tid,),
+        )
+        conn.commit()
+
+        # THE test: no spawn_fn → real default routing resolution.
+        res = kb.dispatch_once(conn, max_spawn=1)
+
+        assert res.spawned == [(tid, "alice", str(workspace))]
+        assert called.get("task") is not None, (
+            "ready-lane real default spawn must route a pending claude-p fallback "
+            "through _spawn_claude_fallback_wrapper"
+        )
+        assert called["task"].id == tid
+
+
+def test_end_run_without_metadata_preserves_attempt_identity(
+    kanban_home, monkeypatch,
+):
+    """A run closure that passes no metadata must NOT wipe the claim-time
+    attempt identity: _fallback_aware_spawn and the fallback chain read
+    requested_executor/fallback_from from task_runs.metadata. The old
+    behaviour overwrote metadata with NULL whenever the caller omitted it,
+    silently losing which executor attempted the card."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="identity", assignee="alice")
+        claimed = kb.claim_task(conn, tid)
+        run_id = claimed.current_run_id
+        meta = _run_metadata(conn, run_id)
+        assert meta.get("requested_executor") == "hermes-profile"
+        assert meta.get("attempt_number") == 1
+
+        kb._end_run(conn, tid, outcome="rate_limited", error="quota", metadata=None)
+
+        preserved = _run_metadata(conn, run_id)
+        assert preserved.get("requested_executor") == "hermes-profile"
+        assert preserved.get("attempt_number") == 1
+        assert preserved.get("outcome") == "rate_limited"
 
 
 def test_check_respawn_guard_ignores_workspace_resolution_failure(kanban_home):
