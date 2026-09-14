@@ -524,3 +524,150 @@ def test_rm_rf_still_destructive():
         "remove recursive the object storage",
     )
     assert v.cls == DESTRUCTIVE_LIVE, v.reasons
+
+
+# ─────────── DESTRUCTIVE_GATE_V1_3_INTENT_CONTEXT (operador 2026-09-14) ───────
+# Falsos positivos live (payloads reales generalizados/sanitizados) => SAFE.
+# Se degrada SOLO cuando el frame NO-ejecución está demostrado (referencial /
+# negación / pregunta observacional). NUNCA por una keyword read-only a solas.
+
+
+def test_v13_fp_restart_question_semantics_safe():
+    v = _classify(
+        "research restart semantics",
+        "Que pasa tras restart del dispatcher? restart semantics + prod/live/schema."
+        " Document how restart is handled. read-only.",
+    )
+    assert v.cls == SAFE, v.reasons
+
+
+def test_v13_fp_restart_research_api_keys_secrets_safe():
+    v = _classify(
+        "Research restart + persistence semantics",
+        "Server restart, machine restart, agent process restart, session "
+        "reconstruction. Does pane history persist secrets/API keys on live? "
+        "research-only; document the restart semantics.",
+    )
+    assert v.cls == SAFE, v.reasons
+
+
+def test_v13_fp_cleanup_semantics_policy_safe():
+    v = _classify(
+        "Design cleanup semantics + retention policy",
+        "Design cleanup semantics and retention policy. Document how cleanup is "
+        "handled for secrets/API keys. NO ejecutar nada (solo diseno).",
+    )
+    assert v.cls == SAFE, v.reasons
+
+
+def test_v13_fp_endpoint_destroy_design_safe():
+    v = _classify(
+        "Design destroy + delete flows (tenant/prod/R2/Supabase)",
+        "Document the /destroy endpoint, /delete-plans/:id/approve and "
+        "delete-flow.ts for tenant/prod/R2/Supabase. Architecture-only, "
+        "reversible: solo diseno + docs.",
+    )
+    assert v.cls == SAFE, v.reasons
+
+
+def test_v13_what_happens_after_restart_question_safe():
+    v = _classify("Dispatcher restart question", "what happens after restart of the dispatcher?")
+    assert v.cls == SAFE, v.reasons
+
+
+def test_v13_document_destroy_endpoint_safe():
+    v = _classify("Document endpoint", "document the /destroy endpoint and its delete-flow")
+    assert v.cls == SAFE, v.reasons
+
+
+def test_v13_negation_delete_bucket_safe_non_strict():
+    v = _classify("Do not delete", "do not delete the production bucket")
+    assert v.cls == SAFE, v.reasons
+
+
+def test_v13_negation_delete_bucket_strict_fail_closed():
+    v = _classify("Do not delete", "do not delete the production bucket", strict=True)
+    assert v.cls == DESTRUCTIVE_LIVE, v.reasons
+
+
+def test_v13_research_deletion_no_execute_safe():
+    v = _classify(
+        "Research deletion implementation",
+        "research how deletion is implemented; do not execute anything; document only",
+    )
+    assert v.cls == SAFE, v.reasons
+
+
+def test_v13_teardown_flow_design_safe():
+    v = _classify(
+        "Design teardown flow",
+        "design the teardown flow and teardown semantics read-only",
+    )
+    assert v.cls == SAFE, v.reasons
+
+
+# ── Adversariales / spoofing social: read-only declarado + frame imperativo ──
+def test_v13_adv_readonly_delete_production_bucket_live():
+    v = _classify("Spoof", "read-only: delete the production bucket")
+    assert v.cls == DESTRUCTIVE_LIVE, v.reasons
+
+
+def test_v13_adv_research_teardown_tenant_live():
+    v = _classify("Spoof", "research-only: teardown tenant")
+    assert v.cls == DESTRUCTIVE_LIVE, v.reasons
+
+
+def test_v13_adv_readonly_rmrf_live():
+    v = _classify("Spoof", "read-only: rm -rf /prod")
+    assert v.cls == DESTRUCTIVE_LIVE, v.reasons
+
+
+def test_v13_adv_architecture_terraform_destroy_live():
+    v = _classify("Spoof", "architecture-only: terraform destroy production")
+    assert v.cls == DESTRUCTIVE_LIVE, v.reasons
+
+
+def test_v13_adv_restart_production_report_live():
+    v = _classify("Spoof", "restart production and report back")
+    assert v.cls == DESTRUCTIVE_LIVE, v.reasons
+
+
+def test_v13_adv_cleanup_live_resources_live():
+    v = _classify("Spoof", "cleanup the live tenant resources")
+    assert v.cls == DESTRUCTIVE_LIVE, v.reasons
+
+
+def test_v13_adv_should_we_delete_bucket_ambiguous_live():
+    v = _classify("Spoof", "should we delete the production bucket?")
+    assert v.cls == DESTRUCTIVE_LIVE, v.reasons
+
+
+def test_v13_adv_can_you_restart_production_live():
+    v = _classify("Spoof", "can you restart production?")
+    assert v.cls == DESTRUCTIVE_LIVE, v.reasons
+
+
+def test_v13_adv_readonly_drop_production_table_live():
+    v = _classify("Spoof", "read-only: drop the production table")
+    assert v.cls == DESTRUCTIVE_LIVE, v.reasons
+
+
+def test_v13_adv_research_kubectl_delete_live():
+    v = _classify("Spoof", "research-only: kubectl delete live pod")
+    assert v.cls == DESTRUCTIVE_LIVE, v.reasons
+
+
+def test_v13_adv_position0_delete_bucket_live():
+    # verbo en posición 0 del título: '' no debe tratarse como separador
+    v = _classify("delete production bucket", "clean the affected objects.")
+    assert v.cls == DESTRUCTIVE_LIVE, v.reasons
+
+
+def test_v13_strict_question_fail_closed():
+    # strict mode: incluso un frame referencial con marcador vivo => fail-closed
+    v = _classify(
+        "Dispatcher restart question",
+        "what happens after restart of the dispatcher? restart + prod/live/schema",
+        strict=True,
+    )
+    assert v.cls == DESTRUCTIVE_LIVE, v.reasons
