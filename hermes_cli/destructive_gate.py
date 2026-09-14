@@ -352,6 +352,160 @@ _HUMAN_DELEGATION_MARKERS = (
 _HUMAN_DELEG_RE = _token_regex(_HUMAN_DELEGATION_MARKERS)
 
 
+# ───────────────── DESTRUCTIVE_GATE_V1_3_INTENT_CONTEXT ──────────────────────
+# Operador 2026-09-14. El classifier distingue INTENT + FRAME, no una keyword.
+# Invariantes:
+#   MENTIONING a destructive operation != REQUESTING it.
+#   RESEARCHING/ARCHITECTING a destructive operation != EXECUTING it.
+#   DECLARING "read-only" != authority to downgrade.
+# Orden conceptual (strict mode preserva fail-closed en todo):
+#   1) firma ejecutable inequívoca            -> DESTRUCTIVE_LIVE (siempre)
+#   2) frame imperativo (verbo -> recurso vivo) -> DESTRUCTIVE_LIVE
+#   3) strict mode + ambigüedad               -> DESTRUCTIVE_LIVE
+#   4) frame NO-ejecución demostrado          -> SAFE (solo non-strict)
+#   5) ambigüedad destructiva no resuelta     -> DESTRUCTIVE_LIVE
+#
+# NEVER-DOWNGRADE / firmas ejecutables inequívocas (una declaración de
+# read-only/research NUNCA las degrada): rm -rf/-r/-f, terraform destroy,
+# DROP/TRUNCATE de objetos DB vivos, kubectl delete, wipe/teardown/erase/
+# terminate de un recurso vivo. Verbos CONTEXT-SENSITIVE (delete/destroy/
+# restart/cleanup/...) no son destructivos solo por aparecer como token.
+_HARD_DESTRUCTIVE_RE = re.compile(
+    r"\b(?:rm\s+-(?:rf|fr|r|f)|"
+    r"terraform\s+destroy|"
+    r"(?:drop|truncate)\s+(?:(?:the|a|an|all|any)\s+)?"
+    r"(?:(?:live|production|prod|staging)\s+)?"
+    r"(?:table|database|db|schema|index|view|collection|sequence|materialized view)|"
+    r"kubectl\s+delete|"
+    r"(?:wipe|teardown|erase|terminate)\s+(?:(?:the|a|an|all|any)\s+)?"
+    r"(?:(?:live|production|prod)\s+)?"
+    r"(?:bucket|r2|s3|object storage|tenant|tenants|database|db|schema|"
+    r"service|infra|infrastructure|cloudflare|supabase|terraform|terraform state))",
+    re.IGNORECASE,
+)
+
+# Reforzador de intención (NUNCA decisor por sí mismo): documenta el downgrade
+# solo cuando el frame NO-ejecución ya está demostrado.
+_READONLY_INTENT_MARKERS = (
+    "read-only", "read only", "research-only", "research only",
+    "architecture-only", "architecture only", "solo diseño", "solo diseno",
+    "design only", "no implementar", "no implementa", "no mutar", "no muta",
+    "sin ejecutar", "sin ejecucion", "no ejecutar", "no ejecuta",
+    "no se ejecuta", "no tocar", "no toque", "do not implement",
+    "never implement", "reversible: solo diseño", "reversible: solo diseno",
+)
+_READONLY_INTENT_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(m) for m in _READONLY_INTENT_MARKERS) + r")\b",
+    re.IGNORECASE,
+)
+
+# Frame imperativo: verbo/predicado que comanda directamente un recurso vivo
+# (<=3 tokens antes del sustantivo vivo). Ejecutable => DESTRUCTIVE_LIVE.
+_LIVE_ACTION_NOUNS = (
+    "bucket", "r2", "s3", "tenant", "tenants", "prod", "production", "live",
+    "database", "db", "schema", "table", "index", "collection", "postgres",
+    "supabase", "migration", "migrations", "deployment", "service", "infra",
+    "infrastructure", "cloudflare", "dns", "record", "route53", "terraform",
+    "credential", "credentials", "secret", "secrets", "user", "users", "key",
+    "keys", "object", "storage", "pod", "pods", "state",
+)
+_ACTION_FRAME_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(v) for v in (_ACTION_PREDICATES + DESTRUCTIVE_VERBS)) + r")\b"
+    r"(?:\s+(?:the|a|an|all|any|this|these|those)?\s*\w+){0,3}\s+"
+    r"(?:" + "|".join(re.escape(n) for n in _LIVE_ACTION_NOUNS) + r")\b",
+    re.IGNORECASE,
+)
+
+# Sustantivos de diseño/política que convierten un verbo en REFERENCIAL
+# (p.ej. "cleanup semantics", "destroy flow", "delete handling").
+_NON_EXECUTION_CONTEXT_NOUNS = (
+    "semantics", "flow", "flows", "policy", "design", "endpoint", "route",
+    "routes", "handler", "handlers", "logic", "pattern", "patterns", "model",
+    "models", "lifecycle", "process", "plan", "plans", "approval", "path",
+    "paths", "api", "layer", "layers", "module", "modules", "architecture",
+    "risk", "risks", "threat", "threats", "requirement", "requirements",
+    "handling", "watch", "watcher", "monitoring", "verification", "verifying",
+    "checking", "guard", "guards", "wrapper", "wrappers", "pipeline",
+    "discussion", "notes", "study", "investigation", "documentation", "doc",
+    "spec", "specs", "list", "section", "mechanism", "diagram", "diagrams",
+    "handled", "handling", "documented", "implemented", "implementing",
+    "described", "mentioned", "explained",
+    # frames SQL/DB (FOR UPDATE SKIP LOCKED) y notación de pipeline
+    "locked", "lock", "skip", "settle", "settled", "clause", "query",
+)
+
+# Preguntas observacionales (pueden acabar en '.' en bodies reales):
+# "qué pasa tras restart del dispatcher." / "what happens after restart".
+_OBSERVATION_QUESTION_RE = re.compile(
+    r"\b(?:what happens|what does|what is|how does|how is|why does|"
+    r"what would|would it|qué pasa|que pasa|qué hace|que hace)\b",
+    re.IGNORECASE,
+)
+
+# Negación explícita de la acción inmediatamente antes del verbo.
+_NEGATION_PRE_RE = re.compile(
+    r"(?:do\s+not|don'?t|never|nunca|not\s+|no\s+|sin\s+|"
+    r"no\s+ejecutar|no\s+ejecutes?|no\s+eliminar|no\s+borrar|no\s+toques?|"
+    r"no\s+modificar|no\s+cambiar|no\s+hacer|no\s+activar|"
+    r"sin\s+ejecutar|sin\s+hacer|sin\s+tocar|sin\s+eliminar|sin\s+modificar)"
+    r"\s*(?:\w+\s+){0,1}$",
+    re.IGNORECASE,
+)
+
+_VERB_INDEX = {v.lower() for v in DESTRUCTIVE_VERBS}
+_ACTIVE_RE = _token_regex(_ACTION_PREDICATES + DESTRUCTIVE_VERBS)
+
+
+def _readonly_intent_declared(title: str, body: str) -> bool:
+    return bool(_READONLY_INTENT_RE.search((title + "\n" + body).lower()))
+
+
+def _action_frame_starts(text: str) -> dict:
+    """start offset (inicio exacto del verbo) -> verbo matcheado del frame."""
+    return {m.start(): m.group(0).lower() for m in _ACTION_FRAME_RE.finditer(text)}
+
+
+def _hit_frame(text: str, start: int, end: int, action_starts: dict) -> str:
+    """Frame de una ocurrencia: NEGATED > ACTION > REFERENTIAL > BARE.
+
+    Path/list/identificador, sustantivo de contexto y pregunta observacional
+    son REFERENTIAL. La negación gana al frame imperativo ("do not delete the
+    production bucket"). Un frame imperativo (verbo -> recurso vivo) gana a la
+    forma de pregunta ("can you restart production?", "should we delete the
+    production bucket?").
+    """
+    pre = text[max(0, start - 60):start]
+    if _NEGATION_PRE_RE.search(pre):
+        return "NEGATED"
+    before = text[start - 1] if start > 0 else ""
+    m2 = re.match(r"\s*(\S)", text[end:end + 4])
+    after_ns = m2.group(1) if m2 else ""
+    # Referencial: path/identificador/list/separador ("/destroy", "delete-flow",
+    # "restart +", "server restart,", "claim→execute→settle", "delete & clean")
+    # o sustantivo de contexto/política ("cleanup semantics", "cleanup is
+    # handled for secrets", "FOR UPDATE SKIP LOCKED"). Se evalúa ANTES del
+    # frame imperativo: el frame solo es ACTION cuando el verbo comanda un
+    # recurso vivo SIN intermediación de contexto.
+    # Membership por TUPLA (no substring string): '' is never "in" a tuple.
+    if before in ("/", ".", "_", "-", ":", "'", '"', "`") or after_ns in (
+        "-", ".", "/", ",", ";", ":", "'", '"', "`", "+", "\u2192", "&", "|",
+    ):
+        return "REFERENTIAL"
+    nxt = re.match(r"\s+(\w+)(?:\s+(\w+))?", text[end:end + 30])
+    if nxt and any(w and w.lower() in _NON_EXECUTION_CONTEXT_NOUNS for w in nxt.groups()):
+        return "REFERENTIAL"
+    if start in action_starts:
+        return "ACTION"
+    m = re.search(r"[.?!\n]", text[end:end + 80])
+    if m and text[end + m.start()] == "?":
+        return "REFERENTIAL"
+    # pregunta observacional sin cierre '?' ("qué pasa tras restart del
+    # dispatcher.") — solo si NO hay frame imperativo (ya descartado arriba)
+    if _OBSERVATION_QUESTION_RE.search(text[max(0, start - 80):start]):
+        return "REFERENTIAL"
+    return "BARE"
+
+
 def _has_action_predicate(title: str, body: str) -> bool:
     """True when the text contains an actionable mutation predicate.
 
@@ -382,11 +536,19 @@ def _action_delegated_to_human(title: str, body: str) -> bool:
 def _classify(title: str, body: str, *, strict: bool = False) -> Verdict:
     """Classify a card as destructive-live or safe. Pure + deterministic.
 
-    UNKNOWN/ambiguity => DESTRUCTIVE_LIVE: a live INFRA resource marker
-    (bucket/tenant/db/prod/infra/...) without a recognised destructive verb
-    ("erase", "terminate", "rm -rf", ...) still requires a human GO — the
-    vocabulary must never silently turn a possibly-destructive live card
-    into SAFE.
+    DESTRUCTIVE_GATE_V1_3_INTENT_CONTEXT (operador 2026-09-14): la
+    clasificación depende de INTENT + FRAME, no de keywords sueltas.
+    Mencionar/investigar/arquitecturar una operación destructiva != pedir
+    ejecutarla; declarar "read-only" != autoridad para degradar.
+
+    Orden (strict preserva fail-closed):
+      1) firma ejecutable inequívoca (rm -rf, terraform destroy, drop|truncate
+         DB, kubectl delete, wipe|teardown|erase|terminate live) -> DESTRUCTIVE_LIVE
+      2) frame imperativo (verbo -> recurso vivo)               -> DESTRUCTIVE_LIVE
+      3) strict mode + ambigüedad                               -> DESTRUCTIVE_LIVE
+      4) frame NO-ejecución demostrado (path/id, sustantivo de política,
+         negación, pregunta observacional)                      -> SAFE (non-strict)
+      5) ambigüedad destructiva no resuelta                     -> DESTRUCTIVE_LIVE
     """
     reasons: List[str] = []
     text = title + "\n" + body
@@ -395,31 +557,56 @@ def _classify(title: str, body: str, *, strict: bool = False) -> Verdict:
         reasons.append("explicit destructive_action directive")
         return Verdict(DESTRUCTIVE_LIVE, reasons)
 
-    if _VERB_RE.search(text):
-        if _has_live_marker(title, body):
-            reasons.append("destructive verb + live-resource marker")
-            return Verdict(DESTRUCTIVE_LIVE, reasons)
-        if strict:
-            reasons.append("destructive verb on strict productive board")
-            return Verdict(DESTRUCTIVE_LIVE, reasons)
-        reasons.append("destructive verb present but no live-resource marker")
-        return Verdict(SAFE, reasons + ["not destructive-live"])
+    # v1.3(1): firma ejecutable inequívoca => SIEMPRE DESTRUCTIVE_LIVE.
+    if _HARD_DESTRUCTIVE_RE.search(text):
+        reasons.append(
+            "UNKNOWN action: hard executable destructive signature "
+            "(rm -rf / terraform destroy / drop|truncate live DB object / "
+            "kubectl delete / wipe|teardown|erase|terminate live) => DESTRUCTIVE_LIVE"
+        )
+        return Verdict(DESTRUCTIVE_LIVE, reasons)
 
-    # No known destructive verb. A live INFRA marker WITHOUT an actionable
-    # predicate is CONTEXT (program name, docs, design) and stays SAFE.
-    # UNKNOWN-action ambiguity (actionable predicate + live marker) maps to
-    # DESTRUCTIVE_LIVE (fail-closed, never guess SAFE for a real action),
-    # UNLESS the card explicitly delegates that action to a human (PR
-    # human-gated, NO auto-merge, merge pending human review, etc.): then the
-    # dispatcher will NOT perform the mutation autonomously and the
-    # UNKNOWN-action ambiguity does not apply. Real destructive verbs
-    # (delete/drop/destroy/...) are evaluated in _VERB_RE above and are NEVER
-    # downgraded by this branch.
-    if _has_infra_live_marker(title, body) and _has_action_predicate(title, body):
+    active = [(m.start(), m.end(), m.group(0).lower()) for m in _ACTIVE_RE.finditer(text)]
+    verbs = [h for h in active if h[2] in _VERB_INDEX]
+    preds = [h for h in active if h[2] not in _VERB_INDEX]
+    action_starts = _action_frame_starts(text)
+    frames = [_hit_frame(text, s, e, action_starts) for (s, e, _) in active]
+    has_action = "ACTION" in frames
+    all_non_exec = bool(active) and all(f in ("REFERENTIAL", "NEGATED") for f in frames)
+    ro = " (read-only/research intent declared)" if _readonly_intent_declared(title, body) else ""
+
+    if verbs and (_has_live_marker(title, body) or strict):
+        # v1.3(4): NON-EXECUTION frame demostrado => SAFE solo en non-strict.
+        if not strict and all_non_exec:
+            reasons.append(
+                "destructive verb present but ONLY in a NON-EXECUTION frame "
+                "(referential paths/identifiers, policy nouns, explicit "
+                "negation, observation question)" + ro + " => SAFE"
+            )
+            return Verdict(SAFE, reasons)
+        if has_action:
+            reasons.append(
+                "destructive verb + live-resource marker (imperative destructive "
+                "action frame on a live resource)"
+            )
+        elif strict:
+            reasons.append("destructive verb on strict productive board")
+        else:
+            reasons.append("destructive verb + live-resource marker")
+        return Verdict(DESTRUCTIVE_LIVE, reasons)
+
+    if not verbs and preds and _has_infra_live_marker(title, body):
         if _action_delegated_to_human(title, body):
             reasons.append(
                 "actionable predicate + live-resource marker, but action "
                 "explicitly delegated to human (human-gated/no auto-merge) => SAFE"
+            )
+            return Verdict(SAFE, reasons)
+        # v1.3(4): NON-EXECUTION frame demostrado => SAFE solo en non-strict.
+        if not strict and all_non_exec:
+            reasons.append(
+                "actionable predicate + live-resource marker, but ONLY in a "
+                "NON-EXECUTION frame (referential/negated/question)" + ro + " => SAFE"
             )
             return Verdict(SAFE, reasons)
         reasons.append(
