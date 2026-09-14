@@ -484,9 +484,13 @@ class TestS3IdleChargedFromLastProgress:
         assert prompt == "fb"
         # Old behavior waited a full interval from the CHECK (~2x idle ≈
         # 0.85s+). New behavior times out ~idle after the last progress
-        # (~0.45s). Allow generous slack while still excluding ~2x.
-        assert elapsed < idle * 1.8, (
-            f"silence exceeded ~2x idle budget shape: {elapsed:.2f}s"
+        # (~0.45s). Budget = idle*1.95 stays BELOW the 2x-threshold the test
+        # guards (idle*2.0) while granting ~60ms of machine slack: under
+        # parallel test-file execution (run_tests.sh) the old razor-thin
+        # idle*1.8 budget failed by ~1ms on loaded CI runners (obs. 0.7212s
+        # vs 0.72s). 1.95x preserves the tested shape (still excludes ~2x).
+        assert elapsed < idle * 1.95, (
+            f"silence exceeded quiet-budget shape (idle*1.95): {elapsed:.2f}s"
         )
         _drain_admission_slots()
 
