@@ -481,18 +481,28 @@ def _hit_frame(text: str, start: int, end: int, action_starts: dict) -> str:
     m2 = re.match(r"\s*(\S)", text[end:end + 4])
     after_ns = m2.group(1) if m2 else ""
     # Referencial: path/identificador/list/separador ("/destroy", "delete-flow",
-    # "restart +", "server restart,", "claim→execute→settle", "delete & clean",
-    # "primitive→active→deprecated→removed)", "disable != drop datos",
-    # "antes del provisioning)"). Se evalúa ANTES del frame imperativo: el
-    # frame solo es ACTION cuando el verbo comanda un recurso vivo SIN
-    # intermediación de contexto. Los separadores de estado/taxonomía
-    # (→ ≠ != = > ( ) | !) son señales REFERENCIALES fuertes en cards de
-    # investigación/diseño (state machines, listas, invariantes).
+    # "restart +", "server restart,", "claim→execute→settle", "delete & clean").
+    # SOLO conectores intra-frase — NUNCA puntuación de mandato: "delete!" /
+    # "drop (" / "(delete ...)" son imperativos y quedan fail-closed como BARE
+    # (QA 2026-09-16: regresión fail-open al incluir ! ( ) en esta tupla).
+    # La taxonomía/estado real ("removed)", "provisioning)") se cubre con la
+    # regla morfológica de abajo, no con separadores planos.
     # Membership por TUPLA (no substring string): '' is never "in" a tuple.
     if before in ("/", ".", "_", "-", ":", "'", '"', "`", "\u2192", "=", "\u2260",
-                  ">", "(", ")", "!", "|") or after_ns in (
+                  ">", "|") or after_ns in (
         "-", ".", "/", ",", ";", ":", "'", '"', "`", "+", "\u2192", "&", "|",
-        "(", ")", "!", "=", "\u2260", ">",
+        "=", "\u2260", ">",
+    ):
+        return "REFERENTIAL"
+    # Formas no imperativas con cierre paren/llave: "removed)" / "provisioning)"
+    # (verbos en forma de estado/gerundio: -ed/-ing/-en) o tras cadena de
+    # transición (→ / >). "drop)" o "delete)" (imperativos base) NO pasan aquí.
+    m3 = re.match(r"\s*(\S)", text[end:end + 4])
+    after_ns3 = m3.group(1) if m3 else ""
+    verb_tok = text[start:end].lower()
+    if after_ns3 in (")", "]", "}") and (
+        verb_tok.endswith(("ed", "ing", "en"))
+        or re.search(r"[→>]", text[max(0, start - 16):start])
     ):
         return "REFERENTIAL"
     nxt = re.match(r"\s+(\w+)(?:\s+(\w+))?", text[end:end + 30])

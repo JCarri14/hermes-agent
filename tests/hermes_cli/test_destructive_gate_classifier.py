@@ -716,6 +716,31 @@ def test_v14_imperative_drop_still_destructive():
     assert v.cls == DESTRUCTIVE_LIVE, v.reasons
 
 
+# ── V1.4 QA rework (2026-09-16): puntuación de mandato NO es referencial ─────
+# Regresión fail-open detectada por QA: "delete!" / "drop (" / "(delete ...)"
+# NO deben degradar a SAFE. Solo formas de estado/gerundio con cierre paren
+# ("removed)", "provisioning)") son referenciales.
+
+
+def test_v14_imperative_punct_after_verb_live():
+    assert _classify("S", "delete! the production bucket").cls == DESTRUCTIVE_LIVE
+    assert _classify("S", "drop! the production table").cls == DESTRUCTIVE_LIVE
+
+
+def test_v14_imperative_paren_live():
+    assert _classify("S", "delete (all production pods)").cls == DESTRUCTIVE_LIVE
+    assert _classify("S", "drop (the table now)").cls == DESTRUCTIVE_LIVE
+    assert _classify("S", "restart (all production workers)").cls == DESTRUCTIVE_LIVE
+    assert _classify("S", "(delete the production bucket)").cls == DESTRUCTIVE_LIVE
+
+
+def test_v14_state_forms_paren_still_safe():
+    v = _classify("Lifecycle", "states: primitive→active→deprecated→removed)")
+    assert v.cls == SAFE, v.reasons
+    v2 = _classify("Resolver", "invalid combos fail before the provisioning).")
+    assert v2.cls == SAFE, v2.reasons
+
+
 def test_v13_strict_question_fail_closed():
     # strict mode: incluso un frame referencial con marcador vivo => fail-closed
     v = _classify(
