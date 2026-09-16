@@ -1847,12 +1847,43 @@ class GatewayKanbanWatchersMixin:
                 if bad_ticks >= HEALTH_WINDOW:
                     now = int(time.time())
                     if now - last_warn_at >= 300:
+                        # WORKER_LONG_RUNNING_LIFECYCLE_RELIABILITY_V1 (R0 capture):
+                        # before warning, name the ready cards the destructive
+                        # gate is silently holding — a gate-held research/design
+                        # card otherwise surfaces as a perpetual generic stuck.
+                        gate_held: list[dict] = []
+                        try:
+                            for _b in (_kb.list_boards(include_archived=False) or []):
+                                _slug = _b.get("slug") or _kb.DEFAULT_BOARD
+                                try:
+                                    _bconn = _kb.connect(board=_slug)
+                                except Exception:
+                                    continue
+                                try:
+                                    gate_held.extend(
+                                        _kb.describe_gate_held_ready(_bconn)
+                                    )
+                                finally:
+                                    try:
+                                        _bconn.close()
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            gate_held = []
                         logger.warning(
                             "kanban dispatcher stuck: ready queue non-empty for "
                             "%d consecutive ticks but 0 workers spawned. Check "
                             "profile health (venv, PATH, credentials) and "
-                            "`hermes kanban list --status ready`.",
+                            "`hermes kanban list --status ready`. "
+                            "gate-held ready cards: %s",
                             bad_ticks,
+                            (
+                                [
+                                    f"{h['task_id']}[{h['assignee']}]: {h['reason']}"
+                                    for h in gate_held
+                                ]
+                                or "none",
+                            ),
                         )
                         last_warn_at = now
             except asyncio.CancelledError:
