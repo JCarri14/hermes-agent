@@ -481,14 +481,28 @@ def _hit_frame(text: str, start: int, end: int, action_starts: dict) -> str:
     m2 = re.match(r"\s*(\S)", text[end:end + 4])
     after_ns = m2.group(1) if m2 else ""
     # Referencial: path/identificador/list/separador ("/destroy", "delete-flow",
-    # "restart +", "server restart,", "claim→execute→settle", "delete & clean")
-    # o sustantivo de contexto/política ("cleanup semantics", "cleanup is
-    # handled for secrets", "FOR UPDATE SKIP LOCKED"). Se evalúa ANTES del
-    # frame imperativo: el frame solo es ACTION cuando el verbo comanda un
-    # recurso vivo SIN intermediación de contexto.
+    # "restart +", "server restart,", "claim→execute→settle", "delete & clean").
+    # SOLO conectores intra-frase — NUNCA puntuación de mandato: "delete!" /
+    # "drop (" / "(delete ...)" son imperativos y quedan fail-closed como BARE
+    # (QA 2026-09-16: regresión fail-open al incluir ! ( ) en esta tupla).
+    # La taxonomía/estado real ("removed)", "provisioning)") se cubre con la
+    # regla morfológica de abajo, no con separadores planos.
     # Membership por TUPLA (no substring string): '' is never "in" a tuple.
-    if before in ("/", ".", "_", "-", ":", "'", '"', "`") or after_ns in (
+    if before in ("/", ".", "_", "-", ":", "'", '"', "`", "\u2192", "=", "\u2260",
+                  ">", "|") or after_ns in (
         "-", ".", "/", ",", ";", ":", "'", '"', "`", "+", "\u2192", "&", "|",
+        "=", "\u2260", ">",
+    ):
+        return "REFERENTIAL"
+    # Formas no imperativas con cierre paren/llave: "removed)" / "provisioning)"
+    # (verbos en forma de estado/gerundio: -ed/-ing/-en) o tras cadena de
+    # transición (→ / >). "drop)" o "delete)" (imperativos base) NO pasan aquí.
+    m3 = re.match(r"\s*(\S)", text[end:end + 4])
+    after_ns3 = m3.group(1) if m3 else ""
+    verb_tok = text[start:end].lower()
+    if after_ns3 in (")", "]", "}") and (
+        verb_tok.endswith(("ed", "ing", "en"))
+        or re.search(r"[→>]", text[max(0, start - 16):start])
     ):
         return "REFERENTIAL"
     nxt = re.match(r"\s+(\w+)(?:\s+(\w+))?", text[end:end + 30])
@@ -498,6 +512,11 @@ def _hit_frame(text: str, start: int, end: int, action_starts: dict) -> str:
         return "ACTION"
     m = re.search(r"[.?!\n]", text[end:end + 80])
     if m and text[end + m.start()] == "?":
+        return "REFERENTIAL"
+    # Comparación/desigualdad inmediatamente antes ("disable != drop datos",
+    # "x ≠ delete", "a == removed") => REFERENTIAL. Evaluada DESPUÉS del frame
+    # imperativo: "!= b, drop the table" sigue ACTION (fail-closed).
+    if re.search(r"(?:!=|≠|==|!==|=>|->)", text[max(0, start - 12):start]):
         return "REFERENTIAL"
     # pregunta observacional sin cierre '?' ("qué pasa tras restart del
     # dispatcher.") — solo si NO hay frame imperativo (ya descartado arriba)
@@ -572,16 +591,26 @@ def _classify(title: str, body: str, *, strict: bool = False) -> Verdict:
     action_starts = _action_frame_starts(text)
     frames = [_hit_frame(text, s, e, action_starts) for (s, e, _) in active]
     has_action = "ACTION" in frames
-    all_non_exec = bool(active) and all(f in ("REFERENTIAL", "NEGATED") for f in frames)
+    # NON-EXECUTION se decide POR-RAMA (v1.4): un hit BARE de un predicado no
+    # debe envenenar el branch de verbos destructivos ni viceversa. Cada branch
+    # solo necesita que LOS SUYOS sean referenciales/negados (nunca un ACTION).
+    verb_frames = [f for (h, f) in zip(active, frames) if h[2] in _VERB_INDEX]
+    pred_frames = [f for (h, f) in zip(active, frames) if h[2] not in _VERB_INDEX]
+    verbs_non_exec = bool(verb_frames) and all(
+        f in ("REFERENTIAL", "NEGATED") for f in verb_frames
+    )
+    preds_non_exec = bool(pred_frames) and all(
+        f in ("REFERENTIAL", "NEGATED") for f in pred_frames
+    )
     ro = " (read-only/research intent declared)" if _readonly_intent_declared(title, body) else ""
 
     if verbs and (_has_live_marker(title, body) or strict):
-        # v1.3(4): NON-EXECUTION frame demostrado => SAFE solo en non-strict.
-        if not strict and all_non_exec:
+        # v1.3/v1.4(4): NON-EXECUTION frame demostrado (solo verbos) => SAFE non-strict.
+        if not strict and verbs_non_exec and not has_action:
             reasons.append(
                 "destructive verb present but ONLY in a NON-EXECUTION frame "
-                "(referential paths/identifiers, policy nouns, explicit "
-                "negation, observation question)" + ro + " => SAFE"
+                "(referential paths/state-machine/taxonomy/separators, policy "
+                "nouns, explicit negation, observation question)" + ro + " => SAFE"
             )
             return Verdict(SAFE, reasons)
         if has_action:
@@ -602,8 +631,8 @@ def _classify(title: str, body: str, *, strict: bool = False) -> Verdict:
                 "explicitly delegated to human (human-gated/no auto-merge) => SAFE"
             )
             return Verdict(SAFE, reasons)
-        # v1.3(4): NON-EXECUTION frame demostrado => SAFE solo en non-strict.
-        if not strict and all_non_exec:
+        # v1.3/v1.4(4): NON-EXECUTION frame demostrado (solo predicados) => SAFE non-strict.
+        if not strict and preds_non_exec and not has_action:
             reasons.append(
                 "actionable predicate + live-resource marker, but ONLY in a "
                 "NON-EXECUTION frame (referential/negated/question)" + ro + " => SAFE"

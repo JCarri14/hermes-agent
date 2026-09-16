@@ -10310,6 +10310,44 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     return False
 
 
+def describe_gate_held_ready(conn: sqlite3.Connection) -> list[dict]:
+    """Ready tasks the destructive gate classifies DESTRUCTIVE_LIVE — the
+    dispatcher silently skips them (never claimed, no event), which makes a
+    gate-held research/design card surface as a perpetual
+    "dispatcher stuck: ready queue non-empty but 0 spawned".
+
+    Used by the gateway stuck diagnostics (WORKER_LONG_RUNNING_LIFECYCLE_
+    RELIABILITY_V1, R0 capture): the warning now names the exact cards so a
+    stuck dispatcher is never silent about its cause.
+
+    Returns ``[{"task_id", "assignee", "classification", "reason"}]``.
+    Fails open to [] — diagnostics must never break the tick.
+    """
+    out: list[dict] = []
+    try:
+        from hermes_cli.destructive_gate import DESTRUCTIVE_LIVE, GateInput, evaluate
+        rows = conn.execute(
+            "SELECT id, title, body, assignee FROM tasks "
+            "WHERE status = 'ready' AND assignee IS NOT NULL AND claim_lock IS NULL"
+        ).fetchall()
+        for r in rows:
+            v = evaluate(
+                GateInput(task_id=r["id"], title=r["title"], body=r["body"] or "")
+            )
+            if v.cls == DESTRUCTIVE_LIVE:
+                out.append(
+                    {
+                        "task_id": r["id"],
+                        "assignee": r["assignee"] or "",
+                        "classification": v.cls,
+                        "reason": "; ".join(v.reasons)[:140],
+                    }
+                )
+    except Exception:
+        out = []
+    return out
+
+
 def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     """Return True iff there is at least one review+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
