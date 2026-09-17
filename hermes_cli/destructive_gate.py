@@ -432,6 +432,17 @@ _NON_EXECUTION_CONTEXT_NOUNS = (
     "described", "mentioned", "explained",
     # frames SQL/DB (FOR UPDATE SKIP LOCKED) y notación de pipeline
     "locked", "lock", "skip", "settle", "settled", "clause", "query",
+    "conteo", "count", "counts", "sequence", "sequences", "contador",
+    "contadores", "counter", "counters",
+)
+
+# Preposiciones de estado/tiempo ("tras disable", "after X", "para el enable")
+# => el verbo es sustantivo/estado, no imperativo. Fail-closed: un frame
+# imperativo se evalúa ANTES y gana ("tras el disable, delete the bucket").
+_STATE_PREPOSITION_RE = re.compile(
+    r"(?:tras|after|post|before|during|durante|para\s+el|para\s+la|"
+    r"al\s+|del\s+|despues\s+de|despues\s+del)\s+(?:\w+\s+){0,1}$",
+    re.IGNORECASE,
 )
 
 # Preguntas observacionales (pueden acabar en '.' en bodies reales):
@@ -517,6 +528,10 @@ def _hit_frame(text: str, start: int, end: int, action_starts: dict) -> str:
     # "x ≠ delete", "a == removed") => REFERENTIAL. Evaluada DESPUÉS del frame
     # imperativo: "!= b, drop the table" sigue ACTION (fail-closed).
     if re.search(r"(?:!=|≠|==|!==|=>|->)", text[max(0, start - 12):start]):
+        return "REFERENTIAL"
+    # Preposición de estado/tiempo previa ("tras disable)", "after enable",
+    # "para el disable") => el verbo es estado/sustantivo, no una acción.
+    if _STATE_PREPOSITION_RE.search(text[max(0, start - 40):start]):
         return "REFERENTIAL"
     # pregunta observacional sin cierre '?' ("qué pasa tras restart del
     # dispatcher.") — solo si NO hay frame imperativo (ya descartado arriba)
