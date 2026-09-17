@@ -741,6 +741,16 @@ def test_v14_state_forms_paren_still_safe():
     assert v2.cls == SAFE, v2.reasons
 
 
+def test_v14_state_preposition_safe():
+    assert _classify("S", "tablas y filas intactas tras disable). fuera de scope").cls == SAFE
+    assert _classify("S", "migración aditiva (reset y conteo de tablas)").cls == SAFE
+
+
+def test_v14_state_preposition_imperative_still_live():
+    assert _classify("S", "tras el disable, delete the production bucket").cls == DESTRUCTIVE_LIVE
+    assert _classify("S", "reset the production sequence now").cls == DESTRUCTIVE_LIVE
+
+
 def test_v13_strict_question_fail_closed():
     # strict mode: incluso un frame referencial con marcador vivo => fail-closed
     v = _classify(
