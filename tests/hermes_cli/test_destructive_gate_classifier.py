@@ -759,3 +759,15 @@ def test_v13_strict_question_fail_closed():
         strict=True,
     )
     assert v.cls == DESTRUCTIVE_LIVE, v.reasons
+
+
+def test_v142_cleanup_after_terminal_state_referential():
+    v = _classify("Observations", "was the runtime still performing cleanup tras done?")
+    assert v.cls == SAFE, v.reasons
+    v2 = _classify("Protocol", "inspect cleanup after completion of the flow")
+    assert v2.cls == SAFE, v2.reasons
+
+
+def test_v142_cleanup_after_table_dropped_still_destructive():
+    v = _classify("Ops", "run cleanup after the production table is dropped")
+    assert v.cls == DESTRUCTIVE_LIVE, v.reasons
