@@ -524,6 +524,13 @@ def _hit_frame(text: str, start: int, end: int, action_starts: dict) -> str:
     m = re.search(r"[.?!\n]", text[end:end + 80])
     if m and text[end + m.start()] == "?":
         return "REFERENTIAL"
+    # Preposición de estado/tiempo posterior al verbo + estado terminal
+    # ("cleanup tras done", "delete after completion") => fase temporal, no imperativo.
+    # NO cubre "cleanup after the table is dropped" (dropped fuera del set => BARE => DL).
+    if re.search(
+        r"\s+(?:tras|after)\s+(?:[a-z]\w+\s+){0,3}(?:is\s+)?(?:done|completed|finished|terminal|ended|settled|complete|closed|completion|reclaimed|reaped)\b",
+        text[end:end + 44], re.I):
+        return "REFERENTIAL"
     # Comparación/desigualdad inmediatamente antes ("disable != drop datos",
     # "x ≠ delete", "a == removed") => REFERENTIAL. Evaluada DESPUÉS del frame
     # imperativo: "!= b, drop the table" sigue ACTION (fail-closed).
