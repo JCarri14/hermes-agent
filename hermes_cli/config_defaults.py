@@ -2873,6 +2873,31 @@ DEFAULT_CONFIG = {
         # to the TTL/crash/stale recovery paths. Set false to keep orphans
         # frozen for manual forensics.
         "reconcile_orphans": True,
+        # Rate-limit requeue cooldown. A worker that bails on a provider quota
+        # wall (EX_TEMPFAIL sentinel) is released back to ready and the respawn
+        # guard defers it this long before trying the same provider again.
+        # Executor fallback overrides this cooldown: when a fallback attempt is
+        # queued, the card re-dispatches immediately through the next executor.
+        "rate_limit_cooldown_seconds": 300,
+        # Executor fallback orchestration (EXECUTOR_FALLBACK_ORCHESTRATION_V1).
+        # NOT ``fallback_providers``: the native provider-fallback list stays
+        # profile-local and can remain [] — this block only drives dispatcher
+        # recovery AFTER a worker already failed with the provider-unavailability
+        # sentinel. Sequence per card: profile default -> claude -p -> explicit
+        # lower-priority route (openrouter/deepseek). One card, one active
+        # executor; bounded attempts; only qualifying provider failures reroute.
+        "executor_fallback": {
+            # Master switch. When false (or HERMES_KANBAN_EXECUTOR_FALLBACK=0),
+            # the legacy rate-limit cooldown behaviour is preserved exactly.
+            "enabled": True,
+            # Maximum total attempts per card across all executors (1 profile
+            # attempt + 2 fallbacks).
+            "max_attempts": 3,
+            # Explicit approved lower-priority route, recorded visibly in the
+            # attempt chain. Never reached unless claude -p was already tried.
+            "lower_provider": "openrouter",
+            "lower_model": "deepseek/deepseek-v4-flash-0731",
+        },
         # Notify subscriptions survive a task reaching ``done`` (completion
         # is reversible — controllers reopen done work for review
         # corrections), and are normally removed on archive. On boards that
